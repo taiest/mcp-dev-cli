@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.1 (2026-04-15)
+
+### Fixes
+- 对齐 `package.json` 的 `bin` 字段为 npm 推荐格式：`dist/index.js`
+- 消除 `npm publish` 时对 `bin[mcp-dev-cli]` 的自动修正 warning
+- 保持仓库源码配置与已发布包元数据一致
+
 ## v0.3.0 (2026-04-15)
 
 ### New Features
