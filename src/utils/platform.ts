@@ -1,6 +1,9 @@
+import { createHash } from 'node:crypto'
 import { existsSync } from 'node:fs'
+import { homedir, platform } from 'node:os'
 import { join, resolve, sep } from 'node:path'
-import { platform } from 'node:os'
+import { spawnSync } from 'node:child_process'
+import { LOCAL_CACHE_ROOT_NAME } from '../types.js'
 
 export function isWindows(): boolean {
   return platform() === 'win32'
@@ -61,7 +64,6 @@ export function detectTechStack(root: string): TechStack {
     stack.frameworks.push('Rust')
   }
 
-  // Detect sub-frameworks
   if (hasFile(root, 'server/go.mod')) stack.frameworks.push('Go (server/)')
   if (hasFile(root, 'miniapp/package.json')) stack.frameworks.push('Taro (miniapp/)')
 
@@ -77,4 +79,33 @@ export function getBuildCommands(root: string): string[] {
     cmds.push('cd server/web/merchant-admin && npx tsc --noEmit')
   }
   return cmds
+}
+
+export function getProjectHash(projectRoot: string): string {
+  return createHash('sha1').update(normalizePath(resolve(projectRoot))).digest('hex')
+}
+
+export function getLocalCacheRoot(): string {
+  return join(homedir(), LOCAL_CACHE_ROOT_NAME)
+}
+
+export function getLocalProjectCacheDir(projectRoot: string): string {
+  return join(getLocalCacheRoot(), getProjectHash(projectRoot))
+}
+
+export function getGitInfo(projectRoot: string): { branch: string; head: string } {
+  return {
+    branch: getGitValue(projectRoot, ['branch', '--show-current']),
+    head: getGitValue(projectRoot, ['rev-parse', 'HEAD']),
+  }
+}
+
+function getGitValue(projectRoot: string, args: string[]): string {
+  try {
+    const child = spawnSync('git', args, { cwd: projectRoot, encoding: 'utf-8' })
+    if (child.status !== 0) return ''
+    return (child.stdout || '').trim()
+  } catch {
+    return ''
+  }
 }

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.3.0 (2026-04-15)
+
+### New Features
+- 新增 4 个上下文连续性工具：`mcp_dev_context_save` / `mcp_dev_context_load` / `mcp_dev_context_snapshot` / `mcp_dev_context_restore`
+- 新增项目级缓存目录 `.claude/cache/`，支持 latest summary 与 snapshots
+- 新增用户本地缓存目录 `~/.claude/mcp-dev-cli/cache/<project-hash>/`，在 Claude Code reload / 重启后继续恢复分析状态
+- `mcp_dev_start` 启动前会自动加载已恢复上下文，并注入任务拆分与 worker 执行提示词
+- `mcp_dev_resume` 续跑前会自动恢复分析上下文，并在执行输出中展示恢复摘要
+- `mcp_dev_status` 现在会显示当前上下文恢复来源与可恢复状态
+- `mcp_dev_init` 现在会自动创建 `.claude/cache/` 和 6 个结构化上下文文件模板
+- README 更新为更偏一键化、新手友好的接入与恢复流程
+
+### Improvements
+- 修复 `start` 链路中恢复上下文重复注入 task splitter prompt 的问题
+- 完成真实冒烟验证：project context / project cache / local cache / snapshot 回退恢复均可用
+- 完成真实冒烟验证：`start` / `resume` 已确认会把恢复上下文注入 orchestration 链路
+
 ## v0.2.0 (2026-04-15)
 
 ### Breaking Changes

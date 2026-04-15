@@ -33,6 +33,51 @@ export interface Checkpoint {
   merge_order: string[]
 }
 
+// ─── 上下文 / 缓存 ───────────────────────────────────────
+
+export interface ContextSummary {
+  goal: string
+  constraints: string[]
+  analysis: string
+  plan: string
+  risks: string[]
+  nextSteps: string[]
+  phase: string
+}
+
+export interface ContextCache {
+  schemaVersion: number
+  projectRoot: string
+  projectHash: string
+  updatedAt: string
+  git: {
+    branch: string
+    head: string
+  }
+  analysis: ContextSummary
+  execution: {
+    phase: string
+    checkpointStatus: string
+    agents: string[]
+    lastResult: string
+  }
+  files: {
+    sessionBrief: string
+    productContext: string
+    screenshotAnalysis: string
+    implementationPlan: string
+    discoveredRisks: string
+    executionHandoff: string
+  }
+}
+
+export interface ContextRestoreResult {
+  source: 'context' | 'project-cache' | 'local-cache' | 'snapshot'
+  summaryText: string
+  cache: ContextSummary | null
+  contextCache?: ContextCache
+}
+
 // ─── 任务拆分 ───────────────────────────────────────────
 
 export interface TaskPlan {
@@ -90,6 +135,7 @@ export interface Config {
   maxConcurrency: number
   projectRoot: string
   autoConfirm: boolean
+  contextSummaryText?: string
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -97,6 +143,7 @@ export const DEFAULT_CONFIG: Config = {
   maxConcurrency: 3,
   projectRoot: process.cwd(),
   autoConfirm: false,
+  contextSummaryText: '',
 }
 
 // ─── 常量 ───────────────────────────────────────────────
@@ -105,4 +152,17 @@ export const AGENTS_DIR = '.claude/agents'
 export const CONTEXT_DIR = '.claude/context'
 export const CONTRACT_DIR = '.claude/context/api-contract'
 export const CHECKPOINT_FILE = '.claude/context/task-checkpoint.json'
+export const CACHE_DIR = '.claude/cache'
+export const CACHE_INDEX_FILE = '.claude/cache/context-index.json'
+export const LATEST_CACHE_FILE = '.claude/cache/latest-summary.json'
+export const LOCAL_CACHE_ROOT_NAME = '.claude/mcp-dev-cli/cache'
 export const BRANCH_PREFIX = 'mcp/'
+
+export const CONTEXT_FILES = {
+  sessionBrief: '.claude/context/session-brief.md',
+  productContext: '.claude/context/product-context.md',
+  screenshotAnalysis: '.claude/context/screenshot-analysis.md',
+  implementationPlan: '.claude/context/implementation-plan.md',
+  discoveredRisks: '.claude/context/discovered-risks.md',
+  executionHandoff: '.claude/context/execution-handoff.md',
+} as const

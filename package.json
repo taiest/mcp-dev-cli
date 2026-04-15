@@ -1,6 +1,6 @@
 {
   "name": "mcp-dev-cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "MCP Server — 多角色并行协同开发工具。AI 自动拆任务、多 Claude 进程并行开发、Git 分支隔离、自动合并编译。在 Claude Code 中直接对话使用。",
   "type": "module",
   "bin": {

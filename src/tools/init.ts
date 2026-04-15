@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { log } from '../utils/logger.js'
 import { detectTechStack } from '../utils/platform.js'
 import { checkClaudeInstalled } from '../utils/claude-cli.js'
-import { AGENTS_DIR, CONTEXT_DIR, CONTRACT_DIR, CHECKPOINT_FILE } from '../types.js'
+import { AGENTS_DIR, CACHE_DIR, CACHE_INDEX_FILE, CHECKPOINT_FILE, CONTEXT_DIR, CONTEXT_FILES, CONTRACT_DIR, LATEST_CACHE_FILE } from '../types.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -39,15 +39,13 @@ export async function initProject(root: string): Promise<string> {
 
   const templatesDir = getTemplatesDir()
 
-  // 1. 创建目录
-  for (const dir of [join(root, AGENTS_DIR), join(root, CONTEXT_DIR), join(root, CONTRACT_DIR)]) {
+  for (const dir of [join(root, AGENTS_DIR), join(root, CONTEXT_DIR), join(root, CONTRACT_DIR), join(root, CACHE_DIR)]) {
     if (!existsSync(dir)) {
       mkdirSync(dir, { recursive: true })
       log.success(`创建目录: ${dir.replace(root, '.')}`)
     }
   }
 
-  // 2. 复制角色模板
   const agentsTemplateDir = join(templatesDir, 'agents')
   if (existsSync(agentsTemplateDir)) {
     const agents = readdirSync(agentsTemplateDir).filter(f => f.endsWith('.md'))
@@ -60,7 +58,6 @@ export async function initProject(root: string): Promise<string> {
     }
   }
 
-  // 3. 生成 CLAUDE.md
   const claudeMdPath = join(root, 'CLAUDE.md')
   if (!existsSync(claudeMdPath)) {
     const template = readFileSync(join(templatesDir, 'claude-md.hbs'), 'utf-8')
@@ -72,20 +69,44 @@ export async function initProject(root: string): Promise<string> {
     log.success('创建 CLAUDE.md')
   }
 
-  // 4. 生成空 checkpoint
   const cpPath = join(root, CHECKPOINT_FILE)
   if (!existsSync(cpPath)) {
     copyFileSync(join(templatesDir, 'checkpoint.json'), cpPath)
     log.success('创建 task-checkpoint.json')
   }
 
-  // 5. 生成 api-contract README
   const contractReadme = join(root, CONTRACT_DIR, 'README.md')
   if (!existsSync(contractReadme)) {
     writeFileSync(contractReadme, '# 接口契约\n\n此目录存放前后端接口契约文件，由 mcp-dev-cli 自动管理。\n', 'utf-8')
   }
 
-  // 6. 更新 .gitignore
+  const contextDefaults: Record<string, string> = {
+    [CONTEXT_FILES.sessionBrief]: '# Session Brief\n\n',
+    [CONTEXT_FILES.productContext]: '# Product Context\n\n',
+    [CONTEXT_FILES.screenshotAnalysis]: '# Screenshot Analysis\n\n',
+    [CONTEXT_FILES.implementationPlan]: '# Implementation Plan\n\n',
+    [CONTEXT_FILES.discoveredRisks]: '# Discovered Risks\n\n',
+    [CONTEXT_FILES.executionHandoff]: '# Execution Handoff\n\n',
+  }
+
+  for (const [file, content] of Object.entries(contextDefaults)) {
+    const filePath = join(root, file)
+    if (!existsSync(filePath)) {
+      writeFileSync(filePath, content, 'utf-8')
+      log.success(`创建上下文文件: ${file.replace('.claude/context/', '')}`)
+    }
+  }
+
+  const cacheIndex = join(root, CACHE_INDEX_FILE)
+  if (!existsSync(cacheIndex)) {
+    writeFileSync(cacheIndex, JSON.stringify({ snapshots: [] }, null, 2), 'utf-8')
+  }
+
+  const latestSummary = join(root, LATEST_CACHE_FILE)
+  if (!existsSync(latestSummary)) {
+    writeFileSync(latestSummary, JSON.stringify({}, null, 2), 'utf-8')
+  }
+
   const gitignorePath = join(root, '.gitignore')
   const ignoreEntries = [
     '# Claude Code 本地缓存',
@@ -93,6 +114,7 @@ export async function initProject(root: string): Promise<string> {
     '.claude/statsig/',
     '.claude/todos/',
     '.claude/credentials.json',
+    '.claude/cache/',
   ]
   if (existsSync(gitignorePath)) {
     const existing = readFileSync(gitignorePath, 'utf-8')
@@ -107,7 +129,8 @@ export async function initProject(root: string): Promise<string> {
   log.header('✅ 初始化完成')
   log.table([
     ['📁 .claude/agents/', `${readdirSync(join(root, AGENTS_DIR)).filter(f => f.endsWith('.md')).length} 个角色`],
-    ['📁 .claude/context/', '断点 + 契约目录'],
+    ['📁 .claude/context/', '断点 + 分析上下文'],
+    ['📁 .claude/cache/', '项目级缓存'],
     ['📄 CLAUDE.md', '协作规范'],
   ])
 

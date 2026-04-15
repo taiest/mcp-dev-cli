@@ -57,7 +57,7 @@ export class TaskSplitter {
 ## 需求
 ${requirement}
 
-请先用 Read/Glob/Grep 工具分析项目结构，然后输出任务拆分 JSON。`
+${this.config.contextSummaryText ? `${this.config.contextSummaryText}\n\n` : ''}请先用 Read/Glob/Grep 工具分析项目结构，然后输出任务拆分 JSON。`
 
     const result = await runClaude({
       prompt,
@@ -69,10 +69,8 @@ ${requirement}
     })
 
     try {
-      // 从 claude JSON 输出中提取 result 字段
       const parsed = JSON.parse(result)
       const content = parsed.result || parsed
-      // 如果 content 是字符串，可能包含 JSON
       if (typeof content === 'string') {
         const jsonMatch = content.match(/\{[\s\S]*\}/)
         if (jsonMatch) {
@@ -81,7 +79,6 @@ ${requirement}
       }
       return content as TaskPlan
     } catch (e) {
-      // 尝试从文本中提取 JSON
       const jsonMatch = result.match(/\{[\s\S]*\}/)
       if (jsonMatch) {
         return JSON.parse(jsonMatch[0]) as TaskPlan

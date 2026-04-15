@@ -7,6 +7,8 @@ import { TaskSplitter } from './task-splitter.js'
 import { WorkerManager } from './worker.js'
 import { Merger } from './merger.js'
 import { ContractManager } from './contract.js'
+import { CacheStore } from './cache-store.js'
+import { ContextStore } from './context-store.js'
 
 export class Orchestrator {
   private config: Config
@@ -16,6 +18,8 @@ export class Orchestrator {
   private workers: WorkerManager
   private merger: Merger
   private contracts: ContractManager
+  private cacheStore: CacheStore
+  private contextStore: ContextStore
 
   constructor(config: Config) {
     this.config = config
@@ -25,24 +29,27 @@ export class Orchestrator {
     this.workers = new WorkerManager(config)
     this.merger = new Merger(config)
     this.contracts = new ContractManager(config.projectRoot)
+    this.cacheStore = new CacheStore(config.projectRoot)
+    this.contextStore = new ContextStore(config.projectRoot)
   }
 
   async start(requirement: string): Promise<string> {
     log.header('🚀 MCP 协同开发')
     log.info(`需求: ${requirement}`)
+    if (this.config.contextSummaryText) {
+      log.blank()
+      log.info('已注入恢复上下文')
+    }
     log.blank()
 
-    // Phase 1: 拆分任务
     const plan = await this.splitter.split(requirement)
     this.displayPlan(plan)
 
-    // 保存接口契约
     if (plan.api_contracts && plan.api_contracts.length > 0) {
       this.contracts.save(plan.api_contracts)
       log.info(`保存了 ${plan.api_contracts.length} 个接口契约`)
     }
 
-    // Phase 2: 创建分支
     const baseBranch = await this.git.currentBranch()
     const stashed = await this.git.stashIfDirty()
     if (stashed) log.git('已暂存未提交的修改')
@@ -58,15 +65,16 @@ export class Orchestrator {
       progress: '',
     }))
     cp.tasks = tasks
+    this.checkpoint.save(cp)
 
-    // 创建 git 分支
+    this.cacheCurrentState('before-branching', cp, plan)
+
     for (const task of tasks) {
       await this.git.checkout(baseBranch)
       await this.git.createBranch(task.branch)
     }
     this.checkpoint.updateStatus(cp, 'branched')
 
-    // Phase 3: 并行执行
     await this.git.checkout(baseBranch)
     this.checkpoint.updateStatus(cp, 'executing')
 
@@ -76,7 +84,6 @@ export class Orchestrator {
 
     const results = await this.workers.runParallel(tasks)
 
-    // 更新 checkpoint
     for (const result of results) {
       this.checkpoint.updateTaskStatus(cp, result.taskId,
         result.success ? 'completed' : 'failed',
@@ -84,7 +91,6 @@ export class Orchestrator {
       )
     }
 
-    // Phase 4: 合并
     this.checkpoint.updateStatus(cp, 'merging')
     await this.git.checkout(baseBranch)
     const mergeResult = await this.merger.mergeAll(results, plan.merge_order, baseBranch)
@@ -93,7 +99,6 @@ export class Orchestrator {
       log.error(`合并阶段有错误: ${mergeResult.errors.join('; ')}`)
     }
 
-    // Phase 5: 编译验证
     const verifyResult = await this.merger.verify()
     if (!verifyResult.success) {
       log.warn('编译验证失败，尝试自动修复...')
@@ -103,11 +108,10 @@ export class Orchestrator {
       }
     }
 
-    // Phase 6: 清理
     this.checkpoint.updateStatus(cp, 'completed')
+    this.cacheCurrentState('after-complete', cp, plan, results)
     this.printReport(cp, results)
 
-    // 恢复 stash
     if (stashed) {
       try { await this.git.stashPop() } catch { /* ignore */ }
     }
@@ -125,11 +129,15 @@ export class Orchestrator {
     log.header('🔄 断点续跑')
     log.info(`恢复会话: ${cp.session_id.slice(0, 8)}`)
     log.info(`需求: ${cp.requirement}`)
+    if (this.config.contextSummaryText) {
+      log.blank()
+      log.info('已恢复分析上下文')
+      log.info(this.config.contextSummaryText)
+    }
 
     const pendingTasks = this.checkpoint.getPendingTasks(cp)
     log.info(`待执行任务: ${pendingTasks.length} 个`)
 
-    // 重新执行
     this.checkpoint.updateStatus(cp, 'executing')
     const results = await this.workers.runParallel(pendingTasks)
 
@@ -140,7 +148,6 @@ export class Orchestrator {
       )
     }
 
-    // 如果全部完成，进入合并
     if (this.checkpoint.isAllCompleted(cp)) {
       this.checkpoint.updateStatus(cp, 'merging')
       await this.git.checkout(cp.base_branch)
@@ -160,6 +167,7 @@ export class Orchestrator {
       this.checkpoint.updateStatus(cp, 'completed')
     }
 
+    this.cacheCurrentState('resume', cp, undefined, results)
     this.printReport(cp, results)
     return log.flush()
   }
@@ -200,5 +208,27 @@ export class Orchestrator {
       log.info(`${icon} [${task.role}] ${task.title}${duration}`)
     }
     log.blank()
+  }
+
+  private cacheCurrentState(reason: string, cp: TaskPlan | ReturnType<CheckpointManager['load']>, plan?: TaskPlan, results?: Array<{ taskId: string; success?: boolean; duration?: number }>): void {
+    const context = this.contextStore.load()
+    const summary = context || {
+      goal: typeof (cp as { requirement?: string }).requirement === 'string' ? (cp as { requirement: string }).requirement : '',
+      constraints: [],
+      analysis: '',
+      plan: plan ? plan.tasks.map(task => `${task.id} [${task.role}] ${task.title}`).join('\n') : '',
+      risks: [],
+      nextSteps: [],
+      phase: typeof (cp as { status?: string }).status === 'string' ? (cp as { status: string }).status : 'planning',
+    }
+
+    this.cacheStore.save(summary, reason, {
+      execution: {
+        phase: summary.phase,
+        checkpointStatus: typeof (cp as { status?: string }).status === 'string' ? (cp as { status: string }).status : '',
+        agents: plan ? [...new Set(plan.tasks.map(task => task.role))] : [],
+        lastResult: results ? results.map(result => `${result.taskId}:${result.success ? 'ok' : 'fail'}`).join(', ') : '',
+      },
+    })
   }
 }

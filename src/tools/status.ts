@@ -1,11 +1,23 @@
+import { CacheStore } from '../core/cache-store.js'
 import { CheckpointManager } from '../core/checkpoint.js'
+import { ContextStore } from '../core/context-store.js'
 
 export function getStatus(projectRoot: string): string {
   const cpManager = new CheckpointManager(projectRoot)
   const cp = cpManager.load()
+  const contextStore = new ContextStore(projectRoot)
+  const cacheStore = new CacheStore(projectRoot)
+  const context = contextStore.load()
+  const restored = cacheStore.loadBestAvailable()
 
   if (!cp || !cp.session_id) {
-    return '当前没有进行中的协同开发任务。使用 mcp_dev_start 开始新任务。'
+    const lines = ['📊 任务状态', '━'.repeat(40), '当前没有进行中的协同开发任务。使用 mcp_dev_start 开始新任务。']
+    if (context) {
+      lines.push('', '已存在项目 context，可直接恢复：', contextStore.buildSummaryText(context))
+    } else if (restored) {
+      lines.push('', `已存在可恢复缓存（${restored.source}）：`, restored.summaryText)
+    }
+    return lines.join('\n')
   }
 
   const lines: string[] = ['📊 任务状态', '━'.repeat(40)]
@@ -15,6 +27,12 @@ export function getStatus(projectRoot: string): string {
   lines.push(`  模型       ${cp.model}`)
   lines.push(`  基准分支   ${cp.base_branch}`)
   lines.push(`  更新时间   ${cp.updated_at}`)
+
+  if (context) {
+    lines.push(`  上下文源   context`)
+  } else if (restored) {
+    lines.push(`  上下文源   ${restored.source}`)
+  }
   lines.push('')
 
   if (cp.tasks.length === 0) {

@@ -53,12 +53,12 @@ export class WorkerManager {
       `\n## 当前任务\n\n${task.description}`,
       task.files.length > 0 ? `\n## 需要关注的文件\n\n${task.files.join('\n')}` : '',
       contracts ? `\n## 接口契约\n\n${contracts}` : '',
+      this.config.contextSummaryText ? `\n${this.config.contextSummaryText}` : '',
       '\n## 重要提示\n\n- 完成后确保代码可编译\n- 不要修改不相关的文件\n- 遵循项目现有代码风格',
     ]
 
     const branch = task.branch.startsWith(BRANCH_PREFIX) ? task.branch : `${BRANCH_PREFIX}${task.branch}`
 
-    // 在任务分支上工作
     try {
       await execa('git', ['checkout', branch], { cwd: this.config.projectRoot })
     } catch {
@@ -78,7 +78,7 @@ export class WorkerManager {
       ], {
         cwd: this.config.projectRoot,
         reject: false,
-        timeout: 1_800_000, // 30 min
+        timeout: 1_800_000,
       })
 
       const success = result.exitCode === 0
@@ -106,7 +106,6 @@ export class WorkerManager {
   }
 
   async runParallel(tasks: TaskState[]): Promise<WorkerResult[]> {
-    // 按依赖分组：无依赖的并行，有依赖的等前置完成
     const completed = new Set<string>()
     const results: WorkerResult[] = []
 
@@ -121,7 +120,6 @@ export class WorkerManager {
         break
       }
 
-      // 限制并发数
       const batch = ready.slice(0, this.config.maxConcurrency)
       log.info(`并行启动 ${batch.length} 个 worker: ${batch.map(t => t.role).join(', ')}`)
 
