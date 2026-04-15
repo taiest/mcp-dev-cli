@@ -1,0 +1,47 @@
+{
+  "name": "mcp-dev-cli",
+  "version": "0.1.0",
+  "description": "多 MCP 并行协同开发 CLI 工具 — AI 自动拆任务、多 Claude 进程并行开发、Git 分支隔离、自动合并编译",
+  "type": "module",
+  "bin": {
+    "mcp-dev-cli": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "src/templates"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "claude",
+    "mcp",
+    "cli",
+    "ai",
+    "orchestrator",
+    "parallel",
+    "development"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "execa": "^9.5.2",
+    "fs-extra": "^11.2.0",
+    "handlebars": "^4.7.8",
+    "inquirer": "^12.6.0",
+    "ora": "^8.1.1"
+  },
+  "devDependencies": {
+    "@types/fs-extra": "^11.0.4",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
