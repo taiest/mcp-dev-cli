@@ -1,38 +1,42 @@
-import chalk from 'chalk'
+// MCP Server 模式下，日志收集为纯文本（不再输出到 console）
 
-const PREFIX = {
-  info: chalk.blue('ℹ'),
-  success: chalk.green('✅'),
-  warn: chalk.yellow('⚠️'),
-  error: chalk.red('❌'),
-  task: chalk.cyan('📋'),
-  role: chalk.magenta('👤'),
-  git: chalk.yellow('🔀'),
-  run: chalk.green('🚀'),
-}
+export class LogCollector {
+  private lines: string[] = []
 
-export const log = {
-  info: (msg: string) => console.log(`${PREFIX.info}  ${msg}`),
-  success: (msg: string) => console.log(`${PREFIX.success} ${msg}`),
-  warn: (msg: string) => console.log(`${PREFIX.warn}  ${msg}`),
-  error: (msg: string) => console.error(`${PREFIX.error} ${chalk.red(msg)}`),
-  task: (msg: string) => console.log(`${PREFIX.task} ${msg}`),
-  role: (msg: string) => console.log(`${PREFIX.role} ${msg}`),
-  git: (msg: string) => console.log(`${PREFIX.git} ${msg}`),
-  run: (msg: string) => console.log(`${PREFIX.run} ${msg}`),
+  info(msg: string) { this.lines.push(`ℹ  ${msg}`) }
+  success(msg: string) { this.lines.push(`✅ ${msg}`) }
+  warn(msg: string) { this.lines.push(`⚠️  ${msg}`) }
+  error(msg: string) { this.lines.push(`❌ ${msg}`) }
+  task(msg: string) { this.lines.push(`📋 ${msg}`) }
+  role(msg: string) { this.lines.push(`👤 ${msg}`) }
+  git(msg: string) { this.lines.push(`🔀 ${msg}`) }
+  run(msg: string) { this.lines.push(`🚀 ${msg}`) }
 
-  header: (title: string) => {
-    const line = '━'.repeat(40)
-    console.log(`\n${chalk.bold(title)}`)
-    console.log(chalk.dim(line))
-  },
+  header(title: string) {
+    this.lines.push('')
+    this.lines.push(title)
+    this.lines.push('━'.repeat(40))
+  }
 
-  table: (rows: Array<[string, string]>) => {
+  table(rows: Array<[string, string]>) {
     const maxKey = Math.max(...rows.map(([k]) => k.length))
     for (const [key, value] of rows) {
-      console.log(`  ${chalk.dim(key.padEnd(maxKey))}  ${value}`)
+      this.lines.push(`  ${key.padEnd(maxKey)}  ${value}`)
     }
-  },
+  }
 
-  blank: () => console.log(),
+  blank() { this.lines.push('') }
+
+  flush(): string {
+    const result = this.lines.join('\n')
+    this.lines = []
+    return result
+  }
+
+  peek(): string {
+    return this.lines.join('\n')
+  }
 }
+
+// 全局单例，各模块共享
+export const log = new LogCollector()

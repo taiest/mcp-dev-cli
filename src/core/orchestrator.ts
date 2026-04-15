@@ -1,8 +1,6 @@
-import chalk from 'chalk'
 import type { Config, TaskPlan, TaskState } from '../types.js'
 import { BRANCH_PREFIX } from '../types.js'
 import { log } from '../utils/logger.js'
-import { confirm } from '../utils/prompt.js'
 import { CheckpointManager } from './checkpoint.js'
 import { GitManager } from './git-manager.js'
 import { TaskSplitter } from './task-splitter.js'
@@ -29,7 +27,7 @@ export class Orchestrator {
     this.contracts = new ContractManager(config.projectRoot)
   }
 
-  async start(requirement: string): Promise<void> {
+  async start(requirement: string): Promise<string> {
     log.header('🚀 MCP 协同开发')
     log.info(`需求: ${requirement}`)
     log.blank()
@@ -37,14 +35,6 @@ export class Orchestrator {
     // Phase 1: 拆分任务
     const plan = await this.splitter.split(requirement)
     this.displayPlan(plan)
-
-    if (!this.config.autoConfirm) {
-      const ok = await confirm('确认执行以上方案？')
-      if (!ok) {
-        log.warn('已取消')
-        return
-      }
-    }
 
     // 保存接口契约
     if (plan.api_contracts && plan.api_contracts.length > 0) {
@@ -80,26 +70,25 @@ export class Orchestrator {
     await this.git.checkout(baseBranch)
     this.checkpoint.updateStatus(cp, 'executing')
 
+    for (const task of tasks) {
+      this.checkpoint.updateTaskStatus(cp, task.id, 'running')
+    }
+
     const results = await this.workers.runParallel(tasks)
 
     // 更新 checkpoint
     for (const result of results) {
       this.checkpoint.updateTaskStatus(cp, result.taskId,
         result.success ? 'completed' : 'failed',
-        { error: result.error }
+        result.success ? undefined : { error: result.error }
       )
-    }
-
-    const failedCount = results.filter(r => !r.success).length
-    if (failedCount > 0) {
-      log.warn(`${failedCount} 个任务失败`)
     }
 
     // Phase 4: 合并
     this.checkpoint.updateStatus(cp, 'merging')
     await this.git.checkout(baseBranch)
-
     const mergeResult = await this.merger.mergeAll(results, plan.merge_order, baseBranch)
+
     if (!mergeResult.success) {
       log.error(`合并阶段有错误: ${mergeResult.errors.join('; ')}`)
     }
@@ -114,75 +103,45 @@ export class Orchestrator {
       }
     }
 
-    // Phase 6: 清理和报告
+    // Phase 6: 清理
     this.checkpoint.updateStatus(cp, 'completed')
-    if (stashed) {
-      await this.git.stashPop()
-      log.git('已恢复暂存的修改')
-    }
-
     this.printReport(cp, results)
 
-    const cleanBranches = await confirm('是否清理任务分支？')
-    if (cleanBranches) {
-      await this.merger.cleanupBranches()
-      this.checkpoint.updateStatus(cp, 'delivered')
+    // 恢复 stash
+    if (stashed) {
+      try { await this.git.stashPop() } catch { /* ignore */ }
     }
+
+    return log.flush()
   }
 
-  async resume(): Promise<void> {
+  async resume(): Promise<string> {
     const cp = this.checkpoint.load()
-    if (!cp) {
-      log.error('没有找到断点文件')
-      return
-    }
-
-    if (!this.checkpoint.hasResumableTasks(cp)) {
-      log.info('所有任务已完成，无需续跑')
-      this.printReport(cp, [])
-      return
+    if (!cp || !this.checkpoint.hasResumableTasks(cp)) {
+      log.info('没有可恢复的任务')
+      return log.flush()
     }
 
     log.header('🔄 断点续跑')
+    log.info(`恢复会话: ${cp.session_id.slice(0, 8)}`)
     log.info(`需求: ${cp.requirement}`)
-    log.info(`状态: ${cp.status}`)
-    log.info(`已完成: ${this.checkpoint.getCompletedTasks(cp).length}/${cp.tasks.length}`)
-    log.blank()
 
-    const pending = this.checkpoint.getPendingTasks(cp)
-    log.info(`待执行任务: ${pending.length} 个`)
-    for (const task of pending) {
-      log.task(`  [${task.role}] ${task.title} (${task.status})`)
-    }
+    const pendingTasks = this.checkpoint.getPendingTasks(cp)
+    log.info(`待执行任务: ${pendingTasks.length} 个`)
 
-    if (!this.config.autoConfirm) {
-      const ok = await confirm('继续执行？')
-      if (!ok) return
-    }
-
-    // 重置 running 状态为 pending
-    for (const task of pending) {
-      if (task.status === 'running') {
-        this.checkpoint.updateTaskStatus(cp, task.id, 'pending')
-      }
-    }
-
-    // 更新模型（支持切换）
-    cp.model = this.config.model
-    this.checkpoint.save(cp)
-
+    // 重新执行
     this.checkpoint.updateStatus(cp, 'executing')
-    const results = await this.workers.runParallel(pending)
+    const results = await this.workers.runParallel(pendingTasks)
 
     for (const result of results) {
       this.checkpoint.updateTaskStatus(cp, result.taskId,
         result.success ? 'completed' : 'failed',
-        { error: result.error }
+        result.success ? undefined : { error: result.error }
       )
     }
 
+    // 如果全部完成，进入合并
     if (this.checkpoint.isAllCompleted(cp)) {
-      // 合并
       this.checkpoint.updateStatus(cp, 'merging')
       await this.git.checkout(cp.base_branch)
 
@@ -191,22 +150,27 @@ export class Orchestrator {
         branch: t.branch,
         success: t.status === 'completed',
       }))
-
       await this.merger.mergeAll(allResults, cp.merge_order, cp.base_branch)
-      await this.merger.verify()
+
+      const verifyResult = await this.merger.verify()
+      if (!verifyResult.success) {
+        await this.merger.fixBuildErrors(verifyResult.errors)
+      }
+
       this.checkpoint.updateStatus(cp, 'completed')
     }
 
     this.printReport(cp, results)
+    return log.flush()
   }
 
   private displayPlan(plan: TaskPlan): void {
     log.header('📋 任务拆分方案')
     for (const task of plan.tasks) {
-      const deps = task.dependencies.length > 0 ? chalk.dim(` (依赖: ${task.dependencies.join(', ')})`) : ''
-      console.log(`  ${chalk.cyan(`#${task.id}`)} [${chalk.magenta(task.role)}] ${task.title}${deps}`)
+      const deps = task.dependencies.length > 0 ? ` (依赖: ${task.dependencies.join(', ')})` : ''
+      log.info(`#${task.id} [${task.role}] ${task.title}${deps}`)
       if (task.files.length > 0) {
-        console.log(`     ${chalk.dim('文件:')} ${task.files.join(', ')}`)
+        log.info(`     文件: ${task.files.join(', ')}`)
       }
     }
     log.blank()
@@ -233,7 +197,7 @@ export class Orchestrator {
       const icon = task.status === 'completed' ? '✅' : task.status === 'failed' ? '❌' : '⏳'
       const result = results.find(r => r.taskId === task.id)
       const duration = result?.duration ? ` (${Math.round(result.duration / 1000)}s)` : ''
-      console.log(`  ${icon} [${task.role}] ${task.title}${duration}`)
+      log.info(`${icon} [${task.role}] ${task.title}${duration}`)
     }
     log.blank()
   }
