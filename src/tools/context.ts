@@ -75,7 +75,7 @@ export function snapshotContext(projectRoot?: string, reason = 'manual-snapshot'
   const context = contextStore.load()
 
   if (!context) {
-    return '当前没有可快照的上下文。请先执行 mcp_dev_context_save。'
+    return '当前没有可快照的上下文。请先执行 parallel_context_save。'
   }
 
   const cache = cacheStore.save(context, reason)

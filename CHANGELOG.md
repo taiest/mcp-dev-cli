@@ -1,5 +1,38 @@
 # Changelog
 
+## v0.5.0 (2026-04-16)
+
+### New Features
+- 新增 `parallel_startup`，统一表达新建 / 继续 / 模板入口与结构化启动流
+- 新增治理化 session 状态与 review / merge gate 展示
+- 新增监控汇总、事件分类、task monitoring rows 与标准 report/export 字段
+- 新增 Git 锁、merge/rebase/cherry-pick 中间态识别与 recovery action 分类
+- 新增结构化 audit trail 持久化到 `.claude/parallel/audit.json`
+- 新增 `ClaudeAdapter` / `ClaudeCliAdapter` 执行适配层边界
+
+### Improvements
+- dashboard 现在同时输出 monitoring、governance、recovery 与 audit trail
+- resume 链路现在会保留并追加结构化审计记录
+- README 与版本信息对齐当前真实能力，不再混淆未正式承诺的范围
+- 新增跨平台 CI build matrix：Linux / macOS / Windows + Node 18 / 20
+
+## v0.4.0 (2026-04-16)
+
+### Breaking Changes
+- 产品主入口统一为 `parallel_*` 工具面，旧工具面不再作为主表达
+- 旧 orchestrator / worker / merger / git-manager / checkpoint / task-splitter / contract 模块降级为兼容层或 retired wrapper
+
+### New Features
+- `parallel_start` 已升级为真实依赖驱动的并行调度执行内核
+- task graph 已按 requirement / stack 生成动态结构，而不是固定流水线
+- stack / policy / contract gate 已进入主链路
+- recovery 记录支持 retry / reassign / replan / resume suggestion
+- `parallel_resume` 现在会真正继续执行 session，而不只是展示状态
+
+### Improvements
+- dashboard / report / resume 统一展示 merge 与 recovery 信息
+- 对内对外产品表述统一为一个整体 parallel platform
+
 ## v0.3.1 (2026-04-15)
 
 ### Fixes
@@ -10,19 +43,19 @@
 ## v0.3.0 (2026-04-15)
 
 ### New Features
-- 新增 4 个上下文连续性工具：`mcp_dev_context_save` / `mcp_dev_context_load` / `mcp_dev_context_snapshot` / `mcp_dev_context_restore`
+- 新增项目级上下文连续性能力，支持分析摘要与恢复状态持久化
 - 新增项目级缓存目录 `.claude/cache/`，支持 latest summary 与 snapshots
 - 新增用户本地缓存目录 `~/.claude/mcp-dev-cli/cache/<project-hash>/`，在 Claude Code reload / 重启后继续恢复分析状态
-- `mcp_dev_start` 启动前会自动加载已恢复上下文，并注入任务拆分与 worker 执行提示词
-- `mcp_dev_resume` 续跑前会自动恢复分析上下文，并在执行输出中展示恢复摘要
-- `mcp_dev_status` 现在会显示当前上下文恢复来源与可恢复状态
-- `mcp_dev_init` 现在会自动创建 `.claude/cache/` 和 6 个结构化上下文文件模板
+- 启动前会自动加载已恢复上下文，并注入调度与执行主链
+- 恢复链路会自动恢复分析上下文，并在执行输出中展示恢复摘要
+- 状态查看现在会显示当前上下文恢复来源与可恢复状态
+- 初始化现在会自动创建 `.claude/cache/` 和结构化上下文文件模板
 - README 更新为更偏一键化、新手友好的接入与恢复流程
 
 ### Improvements
-- 修复 `start` 链路中恢复上下文重复注入 task splitter prompt 的问题
+- 修复启动链路中恢复上下文重复注入任务拆分提示的问题
 - 完成真实冒烟验证：project context / project cache / local cache / snapshot 回退恢复均可用
-- 完成真实冒烟验证：`start` / `resume` 已确认会把恢复上下文注入 orchestration 链路
+- 完成真实冒烟验证：start / resume 已确认会把恢复上下文注入执行链路
 
 ## v0.2.0 (2026-04-15)
 
@@ -31,7 +64,7 @@
 - 移除 commander/inquirer/ora/chalk 依赖
 
 ### New Features
-- 7 个 MCP tools：mcp_dev_init / mcp_dev_start / mcp_dev_resume / mcp_dev_roles_list / mcp_dev_roles_add / mcp_dev_roles_remove / mcp_dev_status
+- 平台初版 MCP tools 已可在 Claude Code 中直接对话使用
 - 在 Claude Code 中直接对话使用，零命令学习成本
 - 天然支持截图+文字混合需求（Claude Code 原生图片能力）
 - 自动检测未初始化项目并自动 init

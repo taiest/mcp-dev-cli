@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { ContextCache, ContextSummary, ContextRestoreResult } from '../types.js'
+import type { ContextSummary } from '../types.js'
 import { CONTEXT_FILES, CONTEXT_DIR } from '../types.js'
 
 function ensureDir(dir: string): void {
@@ -152,34 +152,6 @@ export class ContextStore {
     return sections.join('\n')
   }
 
-  toCache(summary: ContextSummary, base?: Partial<ContextCache>): ContextCache {
-    return {
-      schemaVersion: 1,
-      projectRoot: this.root,
-      projectHash: base?.projectHash || '',
-      updatedAt: new Date().toISOString(),
-      git: base?.git || { branch: '', head: '' },
-      analysis: summary,
-      execution: base?.execution || { phase: summary.phase || 'planning', checkpointStatus: '', agents: [], lastResult: '' },
-      files: {
-        sessionBrief: CONTEXT_FILES.sessionBrief,
-        productContext: CONTEXT_FILES.productContext,
-        screenshotAnalysis: CONTEXT_FILES.screenshotAnalysis,
-        implementationPlan: CONTEXT_FILES.implementationPlan,
-        discoveredRisks: CONTEXT_FILES.discoveredRisks,
-        executionHandoff: CONTEXT_FILES.executionHandoff,
-      },
-    }
-  }
-}
-
-export function buildRestoreResult(source: ContextRestoreResult['source'], summary: ContextSummary | null): ContextRestoreResult {
-  const store = new ContextStore(process.cwd())
-  return {
-    source,
-    summaryText: store.buildSummaryText(summary),
-    cache: summary,
-  }
 }
 
 function extractFirstBody(content: string): string {

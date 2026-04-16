@@ -1,5 +1,4 @@
 import { execa, type ResultPromise } from 'execa'
-import { log } from './logger.js'
 
 export interface ClaudeOptions {
   prompt: string
@@ -16,45 +15,10 @@ export interface ClaudeOptions {
   bare?: boolean
 }
 
-export async function runClaude(options: ClaudeOptions): Promise<string> {
-  const args = buildArgs(options)
-  const result = await execa('claude', args, {
-    cwd: options.cwd,
-    reject: false,
-    timeout: 600_000, // 10 min
-  })
-
-  if (result.exitCode !== 0) {
-    throw new Error(`Claude CLI exited with code ${result.exitCode}: ${result.stderr}`)
-  }
-  return result.stdout
-}
-
-export function spawnClaude(options: ClaudeOptions): ResultPromise {
-  const args = buildArgs(options)
-  return execa('claude', args, {
-    cwd: options.cwd,
-    reject: false,
-    timeout: 1_800_000, // 30 min per worker
-  })
-}
-
-export async function checkClaudeInstalled(): Promise<boolean> {
-  try {
-    const result = await execa('claude', ['--version'], { reject: false })
-    return result.exitCode === 0
-  } catch {
-    return false
-  }
-}
-
-export async function getClaudeVersion(): Promise<string> {
-  try {
-    const result = await execa('claude', ['--version'], { reject: false })
-    return result.stdout.trim()
-  } catch {
-    return 'unknown'
-  }
+export interface ClaudeAdapter {
+  run(options: ClaudeOptions): Promise<string>
+  spawn(options: ClaudeOptions): ResultPromise
+  checkInstalled(): Promise<boolean>
 }
 
 function buildArgs(options: ClaudeOptions): string[] {
@@ -93,3 +57,53 @@ function buildArgs(options: ClaudeOptions): string[] {
 
   return args
 }
+
+export class ClaudeCliAdapter implements ClaudeAdapter {
+  async run(options: ClaudeOptions): Promise<string> {
+    const args = buildArgs(options)
+    const result = await execa('claude', args, {
+      cwd: options.cwd,
+      reject: false,
+      timeout: 600_000,
+    })
+
+    if (result.exitCode !== 0) {
+      throw new Error(`Claude CLI exited with code ${result.exitCode}: ${result.stderr}`)
+    }
+    return result.stdout
+  }
+
+  spawn(options: ClaudeOptions): ResultPromise {
+    const args = buildArgs(options)
+    return execa('claude', args, {
+      cwd: options.cwd,
+      reject: false,
+      timeout: 1_800_000,
+    })
+  }
+
+  async checkInstalled(): Promise<boolean> {
+    try {
+      const result = await execa('claude', ['--version'], { reject: false })
+      return result.exitCode === 0
+    } catch {
+      return false
+    }
+  }
+
+}
+
+const defaultAdapter = new ClaudeCliAdapter()
+
+export async function runClaude(options: ClaudeOptions): Promise<string> {
+  return defaultAdapter.run(options)
+}
+
+export function spawnClaude(options: ClaudeOptions): ResultPromise {
+  return defaultAdapter.spawn(options)
+}
+
+export async function checkClaudeInstalled(): Promise<boolean> {
+  return defaultAdapter.checkInstalled()
+}
+

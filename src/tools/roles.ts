@@ -41,10 +41,10 @@ function loadAgents(root: string): AgentConfig[] {
 export function listRoles(projectRoot: string): string {
   const agents = loadAgents(projectRoot)
   if (agents.length === 0) {
-    return '没有找到角色文件。请先运行 mcp_dev_init 初始化项目。'
+    return '没有找到角色文件。请先运行 parallel_init 初始化项目。'
   }
 
-  const lines: string[] = ['👥 角色列表', '━'.repeat(40)]
+  const lines: string[] = ['👥 Parallel 角色列表', '━'.repeat(40)]
   for (const agent of agents) {
     const desc = agent.description.split('\n')[0].slice(0, 60)
     lines.push(`  👤 ${agent.name.padEnd(20)} ${desc}`)

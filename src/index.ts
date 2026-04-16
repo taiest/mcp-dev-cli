@@ -3,171 +3,148 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod'
-import { initProject } from './tools/init.js'
-import { startDev } from './tools/start.js'
-import { resumeDev } from './tools/resume.js'
-import { listRoles, addRole, removeRole } from './tools/roles.js'
-import { getStatus } from './tools/status.js'
-import { saveContext, loadContext, snapshotContext, restoreContext } from './tools/context.js'
+import { initProjectApp } from './app/init-project.js'
+import { startParallelSession } from './app/start-parallel-session.js'
+import { resumeSession } from './app/resume-session.js'
+import { getDashboard } from './app/get-dashboard.js'
+import { exportParallelReport } from './app/export-report.js'
+import { switchModel } from './app/switch-model.js'
+import { addContract, listContracts } from './app/manage-contracts.js'
+import { PreflightScanner } from './core/preflight/preflight-scanner.js'
+import { SessionRuntime } from './core/runtime/session-runtime.js'
 import { findProjectRoot } from './utils/platform.js'
 
 const server = new McpServer({
   name: 'mcp-dev-cli',
-  version: '0.2.0',
+  version: '0.5.0',
 })
 
 server.tool(
-  'mcp_dev_init',
-  '初始化项目 MCP 协同开发配置（角色、断点目录、CLAUDE.md）。在任何 Git 项目中运行，自动检测技术栈并生成配置。',
+  'parallel_init',
+  '初始化新一代多角色并行开发平台目录、角色模板与基础结构。',
   {
     projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
   },
   async ({ projectRoot }) => {
     const root = projectRoot || findProjectRoot()
-    const result = await initProject(root)
+    const result = await initProjectApp(root)
     return { content: [{ type: 'text' as const, text: result }] }
   }
 )
 
 server.tool(
-  'mcp_dev_start',
-  '输入开发需求，启动多角色并行协同开发。AI 自动拆分任务 → 创建 Git 分支 → 多 Claude 进程并行开发 → 自动合并 → 编译验证。支持文字描述，如果有截图可以先描述截图内容。',
-  {
-    requirement: z.string().describe('开发需求描述（支持详细的文字描述，包括 UI 设计说明、功能要求等）'),
-    projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
-  },
-  async ({ requirement, projectRoot }) => {
-    const root = projectRoot || findProjectRoot()
-    const result = await startDev(requirement, root)
-    return { content: [{ type: 'text' as const, text: result }] }
-  }
-)
-
-server.tool(
-  'mcp_dev_resume',
-  '恢复上次未完成的协同开发任务，从断点继续执行。',
+  'parallel_startup',
+  '查看标准化启动流状态，包含新建任务、历史继续、模板入口、配置校验与 preflight 建议。',
   {
     projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
   },
   async ({ projectRoot }) => {
     const root = projectRoot || findProjectRoot()
-    const result = await resumeDev(root)
-    return { content: [{ type: 'text' as const, text: result }] }
+    const result = await new SessionRuntime(root).buildStartupFlow()
+    return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] }
   }
 )
 
 server.tool(
-  'mcp_dev_context_save',
-  '保存当前项目分析上下文到 .claude/context 和本地缓存，供后续恢复与 resume 使用。',
-  {
-    goal: z.string().describe('当前任务目标'),
-    constraints: z.array(z.string()).optional().describe('已确认约束'),
-    analysis: z.string().optional().describe('需求/截图/现状分析摘要'),
-    plan: z.string().optional().describe('当前实施计划摘要'),
-    risks: z.array(z.string()).optional().describe('已知风险'),
-    nextSteps: z.array(z.string()).optional().describe('下一步建议'),
-    phase: z.string().optional().describe('当前阶段，如 planning / executing'),
-    projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
-  },
-  async (input) => {
-    const result = saveContext(input)
-    return { content: [{ type: 'text' as const, text: result }] }
-  }
-)
-
-server.tool(
-  'mcp_dev_context_load',
-  '读取当前项目的 context 或本地缓存，恢复最近一次分析上下文。',
-  {
-    projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
-    preferLocalCache: z.boolean().optional().describe('优先从本地缓存恢复'),
-  },
-  async ({ projectRoot, preferLocalCache }) => {
-    const result = loadContext(projectRoot, preferLocalCache)
-    return { content: [{ type: 'text' as const, text: result }] }
-  }
-)
-
-server.tool(
-  'mcp_dev_context_snapshot',
-  '为当前项目上下文创建一个快照，便于 reload/重启后恢复。',
-  {
-    projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
-    reason: z.string().optional().describe('快照原因，如 before-reload'),
-  },
-  async ({ projectRoot, reason }) => {
-    const result = snapshotContext(projectRoot, reason)
-    return { content: [{ type: 'text' as const, text: result }] }
-  }
-)
-
-server.tool(
-  'mcp_dev_context_restore',
-  '把最近一次项目上下文从 cache 恢复回 .claude/context。',
-  {
-    projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
-    preferLocalCache: z.boolean().optional().describe('优先从本地缓存恢复'),
-  },
-  async ({ projectRoot, preferLocalCache }) => {
-    const result = restoreContext(projectRoot, preferLocalCache)
-    return { content: [{ type: 'text' as const, text: result }] }
-  }
-)
-
-server.tool(
-  'mcp_dev_roles_list',
-  '查看当前项目配置的所有协同开发角色（名称、描述、模型、工具）。',
+  'parallel_preflight',
+  '执行并行开发前置扫描，检查 Git、Claude、Node、网络和构建能力。',
   {
     projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
   },
   async ({ projectRoot }) => {
     const root = projectRoot || findProjectRoot()
-    const result = listRoles(root)
-    return { content: [{ type: 'text' as const, text: result }] }
+    const scanner = new PreflightScanner()
+    const result = {
+      config: scanner.scanConfig(root),
+      preflight: await scanner.scan(root),
+    }
+    return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] }
   }
 )
 
 server.tool(
-  'mcp_dev_roles_add',
-  '新增一个自定义协同开发角色。',
+  'parallel_start',
+  '启动新一代多角色并行开发 session。',
   {
-    name: z.string().describe('角色英文名称（小写+连字符，如 devops-skill）'),
-    description: z.string().describe('角色职责描述'),
-    model: z.string().optional().describe('使用的模型，默认 sonnet'),
-    tools: z.string().optional().describe('工具列表，默认 Read,Write,Edit,Glob,Grep,Bash'),
-    color: z.string().optional().describe('终端颜色标识'),
+    requirement: z.string().describe('开发需求描述'),
     projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+    mcpCount: z.number().int().min(1).max(12).optional().describe('MCP 节点数量，默认 6'),
   },
-  async ({ name, description, model, tools, color, projectRoot }) => {
+  async ({ requirement, projectRoot, mcpCount }) => {
     const root = projectRoot || findProjectRoot()
-    const result = addRole(root, name, description, model, tools, color)
+    const result = await startParallelSession(requirement, root, mcpCount || 6)
     return { content: [{ type: 'text' as const, text: result }] }
   }
 )
 
 server.tool(
-  'mcp_dev_roles_remove',
-  '删除一个协同开发角色。',
-  {
-    name: z.string().describe('要删除的角色名称'),
-    projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
-  },
-  async ({ name, projectRoot }) => {
-    const root = projectRoot || findProjectRoot()
-    const result = removeRole(root, name)
-    return { content: [{ type: 'text' as const, text: result }] }
-  }
-)
-
-server.tool(
-  'mcp_dev_status',
-  '查看当前协同开发任务的执行状态（进度、各子任务状态）。',
+  'parallel_resume',
+  '恢复上次中断的 parallel session，保留进度、契约与模型状态。',
   {
     projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
   },
   async ({ projectRoot }) => {
     const root = projectRoot || findProjectRoot()
-    const result = getStatus(root)
+    const result = await resumeSession(root)
+    return { content: [{ type: 'text' as const, text: result }] }
+  }
+)
+
+server.tool(
+  'parallel_dashboard',
+  '查看当前 parallel session 的 dashboard 视图。',
+  {
+    projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+  },
+  async ({ projectRoot }) => {
+    const root = projectRoot || findProjectRoot()
+    const result = await getDashboard(root)
+    return { content: [{ type: 'text' as const, text: result }] }
+  }
+)
+
+server.tool(
+  'parallel_report',
+  '导出当前 parallel session 的执行统计报表。',
+  {
+    projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+  },
+  async ({ projectRoot }) => {
+    const root = projectRoot || findProjectRoot()
+    const result = await exportParallelReport(root)
+    return { content: [{ type: 'text' as const, text: result }] }
+  }
+)
+
+server.tool(
+  'parallel_model_switch',
+  '切换指定 MCP 节点模型，保持 session continuity。',
+  {
+    mcpId: z.string().describe('MCP 编号，如 MCP-03'),
+    model: z.string().describe('目标模型名称'),
+    projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+  },
+  async ({ mcpId, model, projectRoot }) => {
+    const root = projectRoot || findProjectRoot()
+    const result = await switchModel(root, mcpId, model)
+    return { content: [{ type: 'text' as const, text: result }] }
+  }
+)
+
+server.tool(
+  'parallel_contracts',
+  '查看或新增 parallel session 的接口契约。',
+  {
+    action: z.enum(['list', 'add']).describe('契约操作'),
+    name: z.string().optional().describe('契约名称，action=add 时必填'),
+    content: z.string().optional().describe('契约内容，action=add 时必填'),
+    projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+  },
+  async ({ action, name, content, projectRoot }) => {
+    const root = projectRoot || findProjectRoot()
+    const result = action === 'add'
+      ? await addContract(root, name || 'unnamed-contract', content || '')
+      : await listContracts(root)
     return { content: [{ type: 'text' as const, text: result }] }
   }
 )

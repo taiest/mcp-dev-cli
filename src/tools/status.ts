@@ -1,68 +1,41 @@
-import { CacheStore } from '../core/cache-store.js'
-import { CheckpointManager } from '../core/checkpoint.js'
-import { ContextStore } from '../core/context-store.js'
+import { SessionRuntime } from '../core/runtime/session-runtime.js'
 
 export function getStatus(projectRoot: string): string {
-  const cpManager = new CheckpointManager(projectRoot)
-  const cp = cpManager.load()
-  const contextStore = new ContextStore(projectRoot)
-  const cacheStore = new CacheStore(projectRoot)
-  const context = contextStore.load()
-  const restored = cacheStore.loadBestAvailable()
+  const session = new SessionRuntime(projectRoot).load()
 
-  if (!cp || !cp.session_id) {
-    const lines = ['📊 任务状态', '━'.repeat(40), '当前没有进行中的协同开发任务。使用 mcp_dev_start 开始新任务。']
-    if (context) {
-      lines.push('', '已存在项目 context，可直接恢复：', contextStore.buildSummaryText(context))
-    } else if (restored) {
-      lines.push('', `已存在可恢复缓存（${restored.source}）：`, restored.summaryText)
-    }
-    return lines.join('\n')
+  if (!session) {
+    return ['📊 Parallel session 状态', '━'.repeat(40), '当前没有进行中的 parallel session。使用 parallel_start 开始新任务。'].join('\n')
   }
 
-  const lines: string[] = ['📊 任务状态', '━'.repeat(40)]
-  lines.push(`  会话 ID    ${cp.session_id.slice(0, 8)}`)
-  lines.push(`  状态       ${cp.status}`)
-  lines.push(`  需求       ${cp.requirement.slice(0, 60)}`)
-  lines.push(`  模型       ${cp.model}`)
-  lines.push(`  基准分支   ${cp.base_branch}`)
-  lines.push(`  更新时间   ${cp.updated_at}`)
+  const completed = session.taskGraph.tasks.filter(task => task.status === 'completed').length
+  const failed = session.taskGraph.tasks.filter(task => task.status === 'failed').length
+  const pending = session.taskGraph.tasks.filter(task => task.status === 'pending' || task.status === 'blocked' || task.status === 'ready').length
+  const running = session.taskGraph.tasks.filter(task => task.status === 'running').length
 
-  if (context) {
-    lines.push(`  上下文源   context`)
-  } else if (restored) {
-    lines.push(`  上下文源   ${restored.source}`)
-  }
+  const lines: string[] = ['📊 Parallel session 状态', '━'.repeat(40)]
+  lines.push(`  会话 ID    ${session.sessionId}`)
+  lines.push(`  阶段       ${session.phase}`)
+  lines.push(`  需求       ${session.requirement.slice(0, 60)}`)
+  lines.push(`  基准分支   ${session.baseBranch}`)
+  lines.push(`  更新时间   ${session.updatedAt}`)
+  lines.push('')
+  lines.push(`进度: ${completed}/${session.taskGraph.tasks.length} 完成 | ${failed} 失败 | ${running} 运行中 | ${pending} 待恢复`)
   lines.push('')
 
-  if (cp.tasks.length === 0) {
-    lines.push('暂无子任务')
-    return lines.join('\n')
+  for (const task of session.taskGraph.tasks) {
+    const icon = task.status === 'completed'
+      ? '✅'
+      : task.status === 'failed'
+        ? '❌'
+        : task.status === 'running'
+          ? '🔄'
+          : '⏳'
+    lines.push(`  ${icon} #${task.id} [${task.roleType}] ${task.title}`)
   }
 
-  const completed = cp.tasks.filter(t => t.status === 'completed').length
-  const failed = cp.tasks.filter(t => t.status === 'failed').length
-  const pending = cp.tasks.filter(t => t.status === 'pending').length
-  const running = cp.tasks.filter(t => t.status === 'running').length
-
-  lines.push(`进度: ${completed}/${cp.tasks.length} 完成 | ${failed} 失败 | ${running} 运行中 | ${pending} 待执行`)
-  lines.push('')
-
-  const icons: Record<string, string> = {
-    completed: '✅', failed: '❌', running: '🔄', pending: '⏳',
-  }
-
-  for (const task of cp.tasks) {
-    const icon = icons[task.status] || '❓'
-    lines.push(`  ${icon} #${task.id} [${task.role}] ${task.title}`)
-    if (task.error) {
-      lines.push(`     ${task.error.slice(0, 80)}`)
-    }
-  }
-
-  if (pending > 0 || running > 0) {
+  if (session.phase !== 'completed') {
     lines.push('')
-    lines.push('使用 mcp_dev_resume 继续执行')
+    lines.push('使用 parallel_resume 继续执行')
   }
 
   return lines.join('\n')

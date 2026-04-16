@@ -1,234 +1,339 @@
-import type { Config, TaskPlan, TaskState } from '../types.js'
-import { BRANCH_PREFIX } from '../types.js'
-import { log } from '../utils/logger.js'
-import { CheckpointManager } from './checkpoint.js'
-import { GitManager } from './git-manager.js'
-import { TaskSplitter } from './task-splitter.js'
-import { WorkerManager } from './worker.js'
-import { Merger } from './merger.js'
-import { ContractManager } from './contract.js'
-import { CacheStore } from './cache-store.js'
-import { ContextStore } from './context-store.js'
+import type {
+  ContractArtifact,
+  ExecutionSession,
+  McpNode,
+  McpNodeStatus,
+  OrchestratedTask,
+  OrchestratedTaskStatus,
+  ReviewApproval,
+  ReviewArtifact,
+  SessionPhase,
+  TaskGraph,
+  TelemetryEvent,
+  WorkspaceDescriptor,
+} from '../types.js'
+import { SessionRuntime } from './runtime/session-runtime.js'
+import { Scheduler } from './scheduler/scheduler.js'
+import { PolicyEngine } from './policy/policy-engine.js'
+import { WorkerRunner } from './worker/worker-runner.js'
+import { QualityGate } from './quality/quality-gate.js'
+import { GitMergeService } from './git/git-merge-service.js'
+import { FailureRecovery } from './recovery/failure-recovery.js'
+import { createAuditRecord } from './telemetry/audit-trail.js'
 
-export class Orchestrator {
-  private config: Config
-  private checkpoint: CheckpointManager
-  private git: GitManager
-  private splitter: TaskSplitter
-  private workers: WorkerManager
-  private merger: Merger
-  private contracts: ContractManager
-  private cacheStore: CacheStore
-  private contextStore: ContextStore
+export function parseReviewArtifacts(
+  sessionArtifacts: Record<string, string>,
+  sessionTasks: Array<{ id: string; roleType: string; assignedMcpId?: string; status: string }>
+): ReviewArtifact[] {
+  const reviewerTask = sessionTasks.find(task => task.roleType === 'reviewer')
+  if (!reviewerTask || reviewerTask.status !== 'completed' || !reviewerTask.assignedMcpId) return []
 
-  constructor(config: Config) {
-    this.config = config
-    this.checkpoint = new CheckpointManager(config.projectRoot)
-    this.git = new GitManager(config.projectRoot)
-    this.splitter = new TaskSplitter(config)
-    this.workers = new WorkerManager(config)
-    this.merger = new Merger(config)
-    this.contracts = new ContractManager(config.projectRoot)
-    this.cacheStore = new CacheStore(config.projectRoot)
-    this.contextStore = new ContextStore(config.projectRoot)
-  }
+  const rawOutput = sessionArtifacts[`output:${reviewerTask.id}`] || ''
+  const lines = rawOutput.split('\n').map(line => line.trim()).filter(Boolean)
+  const artifacts: ReviewArtifact[] = []
 
-  async start(requirement: string): Promise<string> {
-    log.header('🚀 MCP 协同开发')
-    log.info(`需求: ${requirement}`)
-    if (this.config.contextSummaryText) {
-      log.blank()
-      log.info('已注入恢复上下文')
-    }
-    log.blank()
-
-    const plan = await this.splitter.split(requirement)
-    this.displayPlan(plan)
-
-    if (plan.api_contracts && plan.api_contracts.length > 0) {
-      this.contracts.save(plan.api_contracts)
-      log.info(`保存了 ${plan.api_contracts.length} 个接口契约`)
-    }
-
-    const baseBranch = await this.git.currentBranch()
-    const stashed = await this.git.stashIfDirty()
-    if (stashed) log.git('已暂存未提交的修改')
-
-    const cp = this.checkpoint.create(requirement, this.config.model, baseBranch)
-    cp.merge_order = plan.merge_order
-    cp.api_contracts = plan.api_contracts?.map(c => c.name) || []
-
-    const tasks: TaskState[] = plan.tasks.map(t => ({
-      ...t,
-      branch: `${BRANCH_PREFIX}${t.role}-${t.id}`,
-      status: 'pending' as const,
-      progress: '',
-    }))
-    cp.tasks = tasks
-    this.checkpoint.save(cp)
-
-    this.cacheCurrentState('before-branching', cp, plan)
-
-    for (const task of tasks) {
-      await this.git.checkout(baseBranch)
-      await this.git.createBranch(task.branch)
-    }
-    this.checkpoint.updateStatus(cp, 'branched')
-
-    await this.git.checkout(baseBranch)
-    this.checkpoint.updateStatus(cp, 'executing')
-
-    for (const task of tasks) {
-      this.checkpoint.updateTaskStatus(cp, task.id, 'running')
-    }
-
-    const results = await this.workers.runParallel(tasks)
-
-    for (const result of results) {
-      this.checkpoint.updateTaskStatus(cp, result.taskId,
-        result.success ? 'completed' : 'failed',
-        result.success ? undefined : { error: result.error }
-      )
-    }
-
-    this.checkpoint.updateStatus(cp, 'merging')
-    await this.git.checkout(baseBranch)
-    const mergeResult = await this.merger.mergeAll(results, plan.merge_order, baseBranch)
-
-    if (!mergeResult.success) {
-      log.error(`合并阶段有错误: ${mergeResult.errors.join('; ')}`)
-    }
-
-    const verifyResult = await this.merger.verify()
-    if (!verifyResult.success) {
-      log.warn('编译验证失败，尝试自动修复...')
-      const fixed = await this.merger.fixBuildErrors(verifyResult.errors)
-      if (!fixed) {
-        log.error('自动修复失败，请手动检查')
-      }
-    }
-
-    this.checkpoint.updateStatus(cp, 'completed')
-    this.cacheCurrentState('after-complete', cp, plan, results)
-    this.printReport(cp, results)
-
-    if (stashed) {
-      try { await this.git.stashPop() } catch { /* ignore */ }
-    }
-
-    return log.flush()
-  }
-
-  async resume(): Promise<string> {
-    const cp = this.checkpoint.load()
-    if (!cp || !this.checkpoint.hasResumableTasks(cp)) {
-      log.info('没有可恢复的任务')
-      return log.flush()
-    }
-
-    log.header('🔄 断点续跑')
-    log.info(`恢复会话: ${cp.session_id.slice(0, 8)}`)
-    log.info(`需求: ${cp.requirement}`)
-    if (this.config.contextSummaryText) {
-      log.blank()
-      log.info('已恢复分析上下文')
-      log.info(this.config.contextSummaryText)
-    }
-
-    const pendingTasks = this.checkpoint.getPendingTasks(cp)
-    log.info(`待执行任务: ${pendingTasks.length} 个`)
-
-    this.checkpoint.updateStatus(cp, 'executing')
-    const results = await this.workers.runParallel(pendingTasks)
-
-    for (const result of results) {
-      this.checkpoint.updateTaskStatus(cp, result.taskId,
-        result.success ? 'completed' : 'failed',
-        result.success ? undefined : { error: result.error }
-      )
-    }
-
-    if (this.checkpoint.isAllCompleted(cp)) {
-      this.checkpoint.updateStatus(cp, 'merging')
-      await this.git.checkout(cp.base_branch)
-
-      const allResults = cp.tasks.map(t => ({
-        taskId: t.id,
-        branch: t.branch,
-        success: t.status === 'completed',
-      }))
-      await this.merger.mergeAll(allResults, cp.merge_order, cp.base_branch)
-
-      const verifyResult = await this.merger.verify()
-      if (!verifyResult.success) {
-        await this.merger.fixBuildErrors(verifyResult.errors)
-      }
-
-      this.checkpoint.updateStatus(cp, 'completed')
-    }
-
-    this.cacheCurrentState('resume', cp, undefined, results)
-    this.printReport(cp, results)
-    return log.flush()
-  }
-
-  private displayPlan(plan: TaskPlan): void {
-    log.header('📋 任务拆分方案')
-    for (const task of plan.tasks) {
-      const deps = task.dependencies.length > 0 ? ` (依赖: ${task.dependencies.join(', ')})` : ''
-      log.info(`#${task.id} [${task.role}] ${task.title}${deps}`)
-      if (task.files.length > 0) {
-        log.info(`     文件: ${task.files.join(', ')}`)
-      }
-    }
-    log.blank()
-
-    if (plan.api_contracts && plan.api_contracts.length > 0) {
-      log.info(`接口契约: ${plan.api_contracts.map(c => c.name).join(', ')}`)
-    }
-    log.info(`合并顺序: ${plan.merge_order.join(' → ')}`)
-    log.blank()
-  }
-
-  private printReport(cp: ReturnType<CheckpointManager['load']>, results: Array<{ taskId: string; success?: boolean; duration?: number }>): void {
-    if (!cp) return
-    log.header('📊 执行报告')
-    log.table([
-      ['需求', cp.requirement],
-      ['状态', cp.status],
-      ['模型', cp.model],
-      ['基准分支', cp.base_branch],
-    ])
-    log.blank()
-
-    for (const task of cp.tasks) {
-      const icon = task.status === 'completed' ? '✅' : task.status === 'failed' ? '❌' : '⏳'
-      const result = results.find(r => r.taskId === task.id)
-      const duration = result?.duration ? ` (${Math.round(result.duration / 1000)}s)` : ''
-      log.info(`${icon} [${task.role}] ${task.title}${duration}`)
-    }
-    log.blank()
-  }
-
-  private cacheCurrentState(reason: string, cp: TaskPlan | ReturnType<CheckpointManager['load']>, plan?: TaskPlan, results?: Array<{ taskId: string; success?: boolean; duration?: number }>): void {
-    const context = this.contextStore.load()
-    const summary = context || {
-      goal: typeof (cp as { requirement?: string }).requirement === 'string' ? (cp as { requirement: string }).requirement : '',
-      constraints: [],
-      analysis: '',
-      plan: plan ? plan.tasks.map(task => `${task.id} [${task.role}] ${task.title}`).join('\n') : '',
-      risks: [],
-      nextSteps: [],
-      phase: typeof (cp as { status?: string }).status === 'string' ? (cp as { status: string }).status : 'planning',
-    }
-
-    this.cacheStore.save(summary, reason, {
-      execution: {
-        phase: summary.phase,
-        checkpointStatus: typeof (cp as { status?: string }).status === 'string' ? (cp as { status: string }).status : '',
-        agents: plan ? [...new Set(plan.tasks.map(task => task.role))] : [],
-        lastResult: results ? results.map(result => `${result.taskId}:${result.success ? 'ok' : 'fail'}`).join(', ') : '',
-      },
+  for (const line of lines) {
+    const match = /^REVIEW\s+(APPROVED|CHANGES_REQUESTED)\s+(task-\d+)\s*-\s*(.+)$/i.exec(line)
+    if (!match) continue
+    artifacts.push({
+      reviewerMcpId: reviewerTask.assignedMcpId,
+      reviewerTaskId: reviewerTask.id,
+      targetTaskId: match[2],
+      summary: match[3],
+      approved: match[1].toUpperCase() === 'APPROVED',
+      timestamp: new Date().toISOString(),
     })
   }
+
+  return artifacts
+}
+
+export function approvalsFromArtifacts(artifacts: ReviewArtifact[]): ReviewApproval[] {
+  return artifacts.map(item => ({
+    reviewerMcpId: item.reviewerMcpId,
+    taskId: item.targetTaskId,
+    approved: item.approved,
+    comment: item.summary,
+    timestamp: item.timestamp,
+  }))
+}
+
+export function withTaskRunning(session: ExecutionSession, task: OrchestratedTask): ExecutionSession {
+  const updatedTaskGraph: TaskGraph = {
+    tasks: session.taskGraph.tasks.map(item =>
+      item.id === task.id
+        ? { ...item, status: 'running' }
+        : item
+    ),
+  }
+
+  const updatedMcps: McpNode[] = session.mcps.map(item =>
+    item.id === task.assignedMcpId
+      ? { ...item, status: 'running' as McpNodeStatus }
+      : item
+  )
+
+  return {
+    ...session,
+    taskGraph: updatedTaskGraph,
+    mcps: updatedMcps,
+    resumeCursor: {
+      phase: session.phase,
+      taskIds: updatedTaskGraph.tasks.filter(item => item.status !== 'completed').map(item => item.id),
+    },
+  }
+}
+
+export function withTaskStatus(session: ExecutionSession, taskId: string, status: OrchestratedTaskStatus, output: string): ExecutionSession {
+  const updatedTaskGraph: TaskGraph = {
+    tasks: session.taskGraph.tasks.map(item =>
+      item.id === taskId
+        ? {
+            ...item,
+            status,
+            governanceStatus: item.reviewRequired
+              ? status === 'completed'
+                ? 'waiting_approval'
+                : item.governanceStatus
+              : item.governanceStatus,
+            artifacts: output ? [...item.artifacts, `output:${taskId}`] : item.artifacts,
+          }
+        : item
+    ),
+  }
+
+  const targetTask = updatedTaskGraph.tasks.find(task => task.id === taskId)
+  const updatedMcps: McpNode[] = session.mcps.map(item => {
+    if (item.id !== targetTask?.assignedMcpId) return item
+    return {
+      ...item,
+      status: (status === 'failed' ? 'failed' : 'idle') as McpNodeStatus,
+    }
+  })
+
+  const nextPhase: SessionPhase = status === 'failed' ? 'failed' : session.phase
+
+  return {
+    ...session,
+    phase: nextPhase,
+    taskGraph: updatedTaskGraph,
+    mcps: updatedMcps,
+    artifacts: {
+      ...session.artifacts,
+      ...(output ? { [`output:${taskId}`]: output } : {}),
+    },
+    resumeCursor: {
+      phase: nextPhase,
+      taskIds: updatedTaskGraph.tasks.filter(item => item.status !== 'completed').map(item => item.id),
+    },
+  }
+}
+
+export function getRunnableTasks(session: ExecutionSession): OrchestratedTask[] {
+  return session.taskGraph.tasks.filter(task => task.status === 'ready' && task.assignedMcpId)
+}
+
+export function missingWorkerTelemetry(sessionId: string, task: OrchestratedTask, mcpId?: string, activeModel?: string): TelemetryEvent {
+  return {
+    id: `evt-${Date.now()}-${task.id}`,
+    timestamp: new Date().toISOString(),
+    sessionId,
+    mcpId,
+    taskId: task.id,
+    type: 'worker.failed',
+    message: `workspace or node missing for ${task.id}`,
+    activeModel,
+  }
+}
+
+function taskAudit(sessionId: string, task: OrchestratedTask, action: string, status: 'passed' | 'failed', message: string) {
+  return createAuditRecord({
+    sessionId,
+    scope: 'session',
+    action,
+    status,
+    taskId: task.id,
+    mcpId: task.assignedMcpId,
+    actor: task.assignedMcpId,
+    message,
+    metadata: {
+      title: task.title,
+      roleType: task.roleType,
+    },
+  })
+}
+
+export function formatFailedBranches(mergeResult: { failedBranches?: Array<{ branch: string; error?: string }> }): string {
+  return mergeResult.failedBranches?.map(item => `${item.branch}${item.error ? `(${item.error})` : ''}`).join(', ') || 'none'
+}
+
+export function buildMergeSummaryLines(mergeResult: {
+  success: boolean
+  mergeOrder?: string[]
+  mergedBranches?: string[]
+  failedBranches?: Array<{ branch: string; error?: string }>
+  conflicts?: string[]
+  error?: string
+} | null): string[] {
+  return [
+    `merge: ${mergeResult ? (mergeResult.success ? 'passed' : 'failed') : 'none'}`,
+    `merge order: ${mergeResult?.mergeOrder?.join(', ') || 'none'}`,
+    `merged branches: ${mergeResult?.mergedBranches?.join(', ') || 'none'}`,
+    `failed branches: ${mergeResult ? formatFailedBranches(mergeResult) : 'none'}`,
+    `merge conflicts: ${mergeResult?.conflicts?.join(', ') || 'none'}`,
+    `merge error: ${mergeResult?.error || 'none'}`,
+  ]
+}
+
+export async function executeSessionPipeline(options: {
+  projectRoot: string
+  session: ExecutionSession
+  workspaces: Record<string, WorkspaceDescriptor>
+  contracts: ContractArtifact[]
+  context: string
+  taskAction: string
+  mergeAction: string
+  mergeSuccessMessage: string
+  mergeFailureFallback: string
+  includeGovernanceAuditRecord?: boolean
+  includeMergeMetadata?: boolean
+}): Promise<ExecutionSession> {
+  const runtime = new SessionRuntime(options.projectRoot)
+  const scheduler = new Scheduler()
+  const policy = new PolicyEngine()
+  const worker = new WorkerRunner()
+  let running = options.session
+
+  while (true) {
+    running = scheduler.reconcile(running)
+    runtime.save(running)
+
+    const runnableTasks = getRunnableTasks(running)
+    if (runnableTasks.length === 0) break
+
+    const dispatchBatch = runnableTasks.filter(task => {
+      const node = running.mcps.find(item => item.id === task.assignedMcpId)
+      if (!node) return false
+      return node.status !== 'running'
+        && node.status !== 'failed'
+        && policy.canExecuteTask(node, task, running.controllerMcpId)
+    })
+
+    if (dispatchBatch.length === 0) break
+
+    for (const task of dispatchBatch) {
+      running = withTaskRunning(running, task)
+    }
+    runtime.save(running)
+
+    const batchSnapshot = running
+    const results = await Promise.all(
+      dispatchBatch.map(async task => {
+        const node = batchSnapshot.mcps.find(item => item.id === task.assignedMcpId)
+        const workspace = task.assignedMcpId ? options.workspaces[task.assignedMcpId] : undefined
+        if (!node || !workspace) {
+          return {
+            task,
+            result: {
+              success: false,
+              output: '',
+              telemetry: missingWorkerTelemetry(batchSnapshot.sessionId, task, task.assignedMcpId, node?.activeModel),
+            },
+          }
+        }
+
+        const result = await worker.run(batchSnapshot.sessionId, node, task, workspace, options.contracts, options.context)
+        return { task, result }
+      })
+    )
+
+    for (const { task, result } of results) {
+      const nextStatus: OrchestratedTaskStatus = result.success ? 'completed' : 'failed'
+      running = withTaskStatus(running, task.id, nextStatus, result.output)
+      running = runtime.appendTelemetry(running, result.telemetry)
+      running = runtime.appendAudit(running, [
+        taskAudit(running.sessionId, task, options.taskAction, result.success ? 'passed' : 'failed', result.telemetry.message),
+      ])
+      running = scheduler.reconcile(running)
+      runtime.save(running)
+    }
+  }
+
+  const reviewArtifacts = parseReviewArtifacts(running.artifacts, running.taskGraph.tasks)
+  const reviewApprovals = approvalsFromArtifacts(reviewArtifacts)
+  running = scheduler.reconcile({
+    ...running,
+    reviewArtifacts,
+    reviewApprovals,
+  })
+
+  const governanceAudit = policy.buildGovernanceAudit(running, running.reviewAssignments || [], reviewApprovals)
+  const qualityGate = await new QualityGate().runAll(options.projectRoot, running, reviewApprovals)
+  const mergeResult = await new GitMergeService(options.projectRoot).merge(running, options.workspaces)
+  const recovery = !mergeResult.success
+    ? await new FailureRecovery(options.projectRoot).recover(running, mergeResult.error || 'merge failed', options.workspaces)
+    : []
+
+  const failed = running.taskGraph.tasks.filter(task => task.status === 'failed').length
+  const finalPhase: SessionPhase = failed > 0 || !qualityGate.passed || !mergeResult.success
+    ? 'failed'
+    : 'completed'
+
+  const auditRecords = [
+    ...(options.includeGovernanceAuditRecord ? [createAuditRecord({
+      sessionId: running.sessionId,
+      scope: 'governance',
+      action: 'governance-audit',
+      status: 'passed',
+      actor: running.controllerMcpId,
+      message: 'governance audit recorded',
+      metadata: {
+        assignments: String(running.reviewAssignments?.length || 0),
+        approvals: String(reviewApprovals.length),
+      },
+    })] : []),
+    createAuditRecord({
+      sessionId: running.sessionId,
+      scope: 'merge',
+      action: options.mergeAction,
+      status: mergeResult.success ? 'passed' : 'failed',
+      actor: running.controllerMcpId,
+      message: mergeResult.success ? options.mergeSuccessMessage : (mergeResult.error || options.mergeFailureFallback),
+      metadata: options.includeMergeMetadata ? {
+        mergedBranches: String(mergeResult.mergedBranches?.length || 0),
+        failedBranches: String(mergeResult.failedBranches?.length || 0),
+      } : undefined,
+    }),
+    ...recovery.map(item => createAuditRecord({
+      sessionId: running.sessionId,
+      scope: item.action?.startsWith('rollback') ? 'rollback' : 'recovery',
+      action: item.action || 'recovery-step',
+      status: item.status,
+      actor: item.mcpId,
+      mcpId: item.mcpId,
+      taskId: item.taskId,
+      message: item.message,
+      metadata: item.suggestion ? { suggestion: item.suggestion } : undefined,
+    })),
+  ]
+
+  const finalSession: ExecutionSession = runtime.appendAudit({
+    ...running,
+    phase: finalPhase,
+    qualityGate,
+    governanceAudit,
+    reviewArtifacts,
+    reviewApprovals,
+    recovery,
+    artifacts: {
+      ...running.artifacts,
+      mergeResult: JSON.stringify(mergeResult, null, 2),
+    },
+    resumeCursor: {
+      phase: finalPhase,
+      taskIds: running.taskGraph.tasks.filter(task => task.status !== 'completed').map(task => task.id),
+    },
+  }, auditRecords)
+  runtime.save(finalSession)
+  return finalSession
 }

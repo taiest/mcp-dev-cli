@@ -1,18 +1,20 @@
 {
   "name": "mcp-dev-cli",
-  "version": "0.3.1",
-  "description": "MCP Server — 多角色并行协同开发工具。AI 自动拆任务、多 Claude 进程并行开发、Git 分支隔离、自动合并编译。在 Claude Code 中直接对话使用。",
+  "version": "0.5.0",
+  "description": "MCP Server — unified parallel development platform. Structured startup flow, governed multi-role sessions, audit trail, recovery, dashboard, and report export for Claude Code.",
   "type": "module",
   "bin": {
     "mcp-dev-cli": "dist/index.js"
   },
   "files": [
     "dist",
-    "src/templates"
+    "src/templates",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc",
     "dev": "tsx src/index.ts",
+    "ci:build": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "keywords": [

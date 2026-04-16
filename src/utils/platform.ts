@@ -1,17 +1,9 @@
 import { createHash } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir, platform } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { spawnSync } from 'node:child_process'
-import { LOCAL_CACHE_ROOT_NAME } from '../types.js'
-
-export function isWindows(): boolean {
-  return platform() === 'win32'
-}
-
-export function isMac(): boolean {
-  return platform() === 'darwin'
-}
+import { LOCAL_CACHE_ROOT_NAME, PARALLEL_DIR } from '../types.js'
 
 export function normalizePath(p: string): string {
   return p.split(sep).join('/')
@@ -81,6 +73,41 @@ export function getBuildCommands(root: string): string[] {
   return cmds
 }
 
+export function getQualityCommands(root: string): { test: string[]; lint: string[]; security: string[] } {
+  const pkg = readPackageJson(root)
+  const test: string[] = []
+  const lint: string[] = []
+  const security: string[] = []
+
+  if (pkg?.scripts?.test) {
+    test.push('npm run test')
+  } else if (hasFile(root, 'go.mod')) {
+    test.push('go test ./...')
+  }
+
+  if (pkg?.scripts?.lint) {
+    lint.push('npm run lint')
+  } else if (hasFile(root, 'tsconfig.json')) {
+    lint.push('npx tsc --noEmit')
+  }
+
+  if (pkg) {
+    security.push('npm audit --audit-level=high')
+  }
+
+  return { test, lint, security }
+}
+
+function readPackageJson(root: string): { scripts?: Record<string, string> } | null {
+  const file = join(root, 'package.json')
+  if (!existsSync(file)) return null
+  try {
+    return JSON.parse(readFileSync(file, 'utf-8')) as { scripts?: Record<string, string> }
+  } catch {
+    return null
+  }
+}
+
 export function getProjectHash(projectRoot: string): string {
   return createHash('sha1').update(normalizePath(resolve(projectRoot))).digest('hex')
 }
@@ -98,6 +125,18 @@ export function getGitInfo(projectRoot: string): { branch: string; head: string 
     branch: getGitValue(projectRoot, ['branch', '--show-current']),
     head: getGitValue(projectRoot, ['rev-parse', 'HEAD']),
   }
+}
+
+export function hasParallelPlatform(root: string): boolean {
+  return existsSync(join(root, PARALLEL_DIR))
+}
+
+export function hasClaudeMd(root: string): boolean {
+  return existsSync(join(root, 'CLAUDE.md'))
+}
+
+export function hasMcpConfig(root: string): boolean {
+  return existsSync(join(root, '.mcp.json'))
 }
 
 function getGitValue(projectRoot: string, args: string[]): string {

@@ -1,87 +1,53 @@
-import { readFileSync, writeFileSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
-import { randomUUID } from 'node:crypto'
-import type { Checkpoint, TaskState, TaskStatus, CheckpointStatus } from '../types.js'
-import { CHECKPOINT_FILE } from '../types.js'
+import type { Checkpoint, CheckpointStatus, TaskState, TaskStatus } from '../types.js'
 
 export class CheckpointManager {
-  private filePath: string
+  constructor(private projectRoot: string) {}
 
-  constructor(projectRoot: string) {
-    this.filePath = join(projectRoot, CHECKPOINT_FILE)
+  private retired(method: string): never {
+    throw new Error(`legacy CheckpointManager.${method} retired; use parallel session runtime in ${this.projectRoot}`)
   }
 
   exists(): boolean {
-    return existsSync(this.filePath)
+    return false
   }
 
   load(): Checkpoint | null {
-    if (!this.exists()) return null
-    try {
-      const raw = readFileSync(this.filePath, 'utf-8')
-      return JSON.parse(raw) as Checkpoint
-    } catch {
-      return null
-    }
+    return null
   }
 
-  create(requirement: string, model: string, baseBranch: string): Checkpoint {
-    const cp: Checkpoint = {
-      version: 1,
-      session_id: randomUUID(),
-      updated_at: new Date().toISOString(),
-      status: 'planned',
-      requirement,
-      model,
-      base_branch: baseBranch,
-      tasks: [],
-      api_contracts: [],
-      merge_order: [],
-    }
-    this.save(cp)
-    return cp
+  create(_requirement: string, _model: string, _baseBranch: string): Checkpoint {
+    this.retired('create')
   }
 
-  save(cp: Checkpoint): void {
-    cp.updated_at = new Date().toISOString()
-    writeFileSync(this.filePath, JSON.stringify(cp, null, 2), 'utf-8')
+  save(_cp: Checkpoint): void {
+    this.retired('save')
   }
 
-  updateStatus(cp: Checkpoint, status: CheckpointStatus): void {
-    cp.status = status
-    this.save(cp)
+  updateStatus(_cp: Checkpoint, _status: CheckpointStatus): void {
+    this.retired('updateStatus')
   }
 
-  updateTask(cp: Checkpoint, taskId: string, updates: Partial<TaskState>): void {
-    const task = cp.tasks.find(t => t.id === taskId)
-    if (task) {
-      Object.assign(task, updates)
-      this.save(cp)
-    }
+  updateTask(_cp: Checkpoint, _taskId: string, _updates: Partial<TaskState>): void {
+    this.retired('updateTask')
   }
 
-  updateTaskStatus(cp: Checkpoint, taskId: string, status: TaskStatus, extra?: Partial<TaskState>): void {
-    this.updateTask(cp, taskId, {
-      status,
-      ...(status === 'running' ? { started_at: new Date().toISOString() } : {}),
-      ...(status === 'completed' || status === 'failed' ? { completed_at: new Date().toISOString() } : {}),
-      ...extra,
-    })
+  updateTaskStatus(_cp: Checkpoint, _taskId: string, _status: TaskStatus, _extra?: Partial<TaskState>): void {
+    this.retired('updateTaskStatus')
   }
 
-  getPendingTasks(cp: Checkpoint): TaskState[] {
-    return cp.tasks.filter(t => t.status === 'pending' || t.status === 'running')
+  getPendingTasks(_cp: Checkpoint): TaskState[] {
+    return []
   }
 
-  getCompletedTasks(cp: Checkpoint): TaskState[] {
-    return cp.tasks.filter(t => t.status === 'completed')
+  getCompletedTasks(_cp: Checkpoint): TaskState[] {
+    return []
   }
 
-  isAllCompleted(cp: Checkpoint): boolean {
-    return cp.tasks.every(t => t.status === 'completed')
+  isAllCompleted(_cp: Checkpoint): boolean {
+    return false
   }
 
-  hasResumableTasks(cp: Checkpoint): boolean {
-    return cp.tasks.some(t => t.status === 'pending' || t.status === 'running')
+  hasResumableTasks(_cp: Checkpoint): boolean {
+    return false
   }
 }

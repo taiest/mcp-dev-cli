@@ -1,4 +1,4 @@
-// ─── 任务状态 ───────────────────────────────────────────
+// ─── 兼容层类型（待后续彻底移除） ─────────────────────────
 
 export type TaskStatus = 'pending' | 'running' | 'completed' | 'failed'
 export type CheckpointStatus = 'planned' | 'branched' | 'executing' | 'merging' | 'completed' | 'delivered'
@@ -32,8 +32,6 @@ export interface Checkpoint {
   api_contracts: string[]
   merge_order: string[]
 }
-
-// ─── 上下文 / 缓存 ───────────────────────────────────────
 
 export interface ContextSummary {
   goal: string
@@ -78,8 +76,6 @@ export interface ContextRestoreResult {
   contextCache?: ContextCache
 }
 
-// ─── 任务拆分 ───────────────────────────────────────────
-
 export interface TaskPlan {
   tasks: TaskDefinition[]
   merge_order: string[]
@@ -101,8 +97,6 @@ export interface ApiContract {
   content: string
 }
 
-// ─── 角色 ───────────────────────────────────────────────
-
 export interface AgentConfig {
   name: string
   description: string
@@ -111,8 +105,6 @@ export interface AgentConfig {
   color: string
   content: string
 }
-
-// ─── Worker ─────────────────────────────────────────────
 
 export interface WorkerResult {
   taskId: string
@@ -126,9 +118,13 @@ export interface MergeResult {
   success: boolean
   conflicts?: string[]
   error?: string
+  mergeOrder?: string[]
+  mergedBranches?: string[]
+  failedBranches?: Array<{
+    branch: string
+    error?: string
+  }>
 }
-
-// ─── 配置 ───────────────────────────────────────────────
 
 export interface Config {
   model: string
@@ -145,8 +141,6 @@ export const DEFAULT_CONFIG: Config = {
   autoConfirm: false,
   contextSummaryText: '',
 }
-
-// ─── 常量 ───────────────────────────────────────────────
 
 export const AGENTS_DIR = '.claude/agents'
 export const CONTEXT_DIR = '.claude/context'
@@ -166,3 +160,380 @@ export const CONTEXT_FILES = {
   discoveredRisks: '.claude/context/discovered-risks.md',
   executionHandoff: '.claude/context/execution-handoff.md',
 } as const
+
+// ─── 新版并行平台类型 ─────────────────────────────────────
+
+export type McpRoleType = 'controller' | 'developer' | 'tester' | 'analyst' | 'architect' | 'reviewer'
+export type McpNodeStatus = 'idle' | 'assigned' | 'running' | 'blocked' | 'failed' | 'completed'
+export type OrchestratedTaskStatus = 'pending' | 'ready' | 'running' | 'blocked' | 'reviewing' | 'completed' | 'failed'
+export type SessionPhase = 'planning' | 'preflight' | 'running' | 'reviewing' | 'merging' | 'completed' | 'failed'
+export type PreflightStatus = 'passed' | 'warning' | 'failed'
+export type ContractValidationStatus = 'pending' | 'valid' | 'invalid'
+
+export interface TokenBudget {
+  softLimit: number
+  hardLimit: number
+}
+
+export interface ModelPolicy {
+  preferredModel: string
+  fallbackModels: string[]
+  allowAutoSwitch: boolean
+  preserveProgressOnSwitch: boolean
+}
+
+export type McpAction = 'assign' | 'execute' | 'review' | 'approve' | 'merge' | 'override' | 'switch-model'
+export type GovernanceStatus = 'pending' | 'review_required' | 'review_assigned' | 'waiting_approval' | 'review_rejected' | 'ready_for_merge' | 'merged'
+
+export interface GovernancePolicy {
+  canAssign: boolean
+  canExecute: boolean
+  canReview: boolean
+  canApprove: boolean
+  canMerge: boolean
+  canOverride: boolean
+}
+
+export interface GovernanceState {
+  status: GovernanceStatus
+  reviewRequiredTaskIds: string[]
+  reviewAssignedTaskIds: string[]
+  approvedTaskIds: string[]
+  rejectedTaskIds: string[]
+  readyForMerge: boolean
+  mergeApprovedBy?: string
+}
+
+export interface ReviewAssignment {
+  taskId: string
+  reviewerMcpId: string
+  authorizedBy: string
+  authorizedAt: string
+}
+
+export interface GovernanceAuditRecord {
+  action: McpAction
+  actorMcpId: string
+  targetTaskId?: string
+  targetMcpId?: string
+  allowed: boolean
+  reason: string
+  timestamp: string
+}
+
+export interface McpNode {
+  id: string
+  roleType: McpRoleType
+  name: string
+  priority: number
+  permissions: string[]
+  governancePolicy?: GovernancePolicy
+  tokenBudget: TokenBudget
+  workspaceId: string
+  status: McpNodeStatus
+  activeModel: string
+  modelPolicy: ModelPolicy
+}
+
+export interface OrchestratedTask {
+  id: string
+  title: string
+  description: string
+  roleType: McpRoleType
+  assignedMcpId?: string
+  files: string[]
+  dependencies: string[]
+  priority: number
+  status: OrchestratedTaskStatus
+  governanceStatus?: GovernanceStatus
+  reviewRequired: boolean
+  reviewAssignedTo: string[]
+  approvedBy?: string[]
+  rejectedBy?: string[]
+  tokenBudget?: number
+  fallbackPlan: string[]
+  artifacts: string[]
+  contracts: string[]
+  prompt: string
+}
+
+export interface ContractArtifact {
+  id: string
+  name: string
+  producerTaskId: string
+  consumerTaskIds: string[]
+  version: number
+  content: string
+  validationStatus: ContractValidationStatus
+}
+
+export interface TaskGraph {
+  tasks: OrchestratedTask[]
+}
+
+export interface PreflightCheckResult {
+  name: string
+  status: PreflightStatus
+  message: string
+  autoFixable: boolean
+  fixAction?: string
+  category?: 'environment' | 'config' | 'build' | 'git' | 'network'
+  currentState?: string
+  nextStep?: string
+}
+
+export interface ProjectConfigCheck {
+  name: string
+  status: PreflightStatus
+  message: string
+  path?: string
+  autoFixable: boolean
+  fixAction?: string
+  nextStep?: string
+}
+
+export interface ProjectConfigReport {
+  passed: boolean
+  checks: ProjectConfigCheck[]
+}
+
+export interface ProjectDiscovery {
+  root: string
+  initialized: boolean
+  hasGit: boolean
+  hasClaudeMd: boolean
+  hasMcpConfig: boolean
+  hasParallelDir: boolean
+  stack: string[]
+}
+
+export interface SessionHistoryEntry {
+  sessionId: string
+  requirement: string
+  phase: SessionPhase
+  createdAt: string
+  updatedAt: string
+  controllerMcpId: string
+  resumable: boolean
+}
+
+export interface StartupTemplate {
+  id: string
+  title: string
+  description: string
+  requirement: string
+}
+
+export interface StartupFlowStep {
+  key: string
+  title: string
+  status: 'completed' | 'ready' | 'warning' | 'failed'
+  message: string
+  blocking: boolean
+  fixAction?: string
+  nextStep?: string
+}
+
+export interface StartupFlowState {
+  projectRoot: string
+  discovery: ProjectDiscovery
+  config: ProjectConfigReport
+  preflight: PreflightReport
+  recentSessions: SessionHistoryEntry[]
+  templates: StartupTemplate[]
+  entries: {
+    newSession: {
+      available: boolean
+      reason?: string
+    }
+    resume: {
+      available: boolean
+      reason?: string
+    }
+    template: {
+      available: boolean
+      reason?: string
+    }
+  }
+  recommendedEntry: 'new' | 'resume' | 'template'
+  steps: StartupFlowStep[]
+}
+
+export interface PreflightReport {
+  passed: boolean
+  checks: PreflightCheckResult[]
+}
+
+export interface AuditRecord {
+  id: string
+  timestamp: string
+  sessionId: string
+  scope: 'startup' | 'session' | 'adapter' | 'governance' | 'review' | 'merge' | 'recovery' | 'rollback'
+  action: string
+  status: 'passed' | 'failed'
+  actor?: string
+  taskId?: string
+  mcpId?: string
+  target?: string
+  message: string
+  metadata?: Record<string, string>
+}
+
+export interface TelemetryEvent {
+  id: string
+  timestamp: string
+  sessionId: string
+  mcpId?: string
+  taskId?: string
+  type: string
+  message: string
+  durationMs?: number
+  totalTokens?: number
+  activeModel?: string
+  metadata?: Record<string, string>
+}
+
+export interface ReviewApproval {
+  reviewerMcpId: string
+  taskId: string
+  approved: boolean
+  comment?: string
+  timestamp: string
+}
+
+export interface ReviewArtifact {
+  reviewerMcpId: string
+  reviewerTaskId: string
+  targetTaskId: string
+  summary: string
+  approved: boolean
+  timestamp: string
+}
+
+export interface RecoveryRecord {
+  step: string
+  status: 'passed' | 'failed'
+  message: string
+  timestamp: string
+  taskId?: string
+  mcpId?: string
+  action?: 'retry' | 'reassign' | 'rollback' | 'rollback-single-task' | 'rollback-merge-step' | 'replan' | 'resume' | 'diagnose' | 'manual-attention'
+  suggestion?: string
+}
+
+export interface ExecutionSession {
+  sessionId: string
+  projectRoot: string
+  requirement: string
+  baseBranch: string
+  controllerMcpId: string
+  phase: SessionPhase
+  createdAt: string
+  updatedAt: string
+  stack: string[]
+  mcps: McpNode[]
+  taskGraph: TaskGraph
+  contracts: ContractArtifact[]
+  preflight?: PreflightReport
+  contractGate?: PreflightReport
+  qualityGate?: PreflightReport
+  governance?: GovernanceState
+  reviewAssignments?: ReviewAssignment[]
+  governanceAudit?: GovernanceAuditRecord[]
+  reviewApprovals?: ReviewApproval[]
+  reviewArtifacts?: ReviewArtifact[]
+  recovery?: RecoveryRecord[]
+  auditTrail?: AuditRecord[]
+  telemetry: TelemetryEvent[]
+  artifacts: Record<string, string>
+  resumeCursor: {
+    phase: SessionPhase
+    taskIds: string[]
+  }
+}
+
+export interface McpExecutionReportRow {
+  mcpId: string
+  roleName: string
+  workContent: string
+  progressStatus: string
+  durationMs: number
+  totalTokens: number
+  activeModel: string
+}
+
+export interface TelemetryBreakdown {
+  sessionLifecycle: number
+  taskLifecycle: number
+  workerLifecycle: number
+  reviewLifecycle: number
+  mergeLifecycle: number
+  recoveryLifecycle: number
+  other: number
+}
+
+export interface TaskMonitoringRow {
+  taskId: string
+  title: string
+  assignedMcpId?: string
+  roleType: McpRoleType
+  status: OrchestratedTaskStatus
+  governanceStatus?: GovernanceStatus
+  durationMs: number
+  totalTokens: number
+}
+
+export interface MonitoringSummary {
+  totalDurationMs: number
+  totalTokens: number
+  telemetryCount: number
+  warningCount: number
+  failureCount: number
+  activeModelUsage: Array<{
+    model: string
+    count: number
+  }>
+  eventBreakdown: TelemetryBreakdown
+  taskRows: TaskMonitoringRow[]
+}
+
+export interface ExecutionSummaryReport {
+  sessionId: string
+  totalDurationMs: number
+  totalTokens: number
+  completedCount: number
+  failedCount: number
+  blockedCount: number
+  governanceStatus?: GovernanceStatus
+  telemetryCount?: number
+  warningCount?: number
+  failureCount?: number
+  monitoring?: MonitoringSummary
+  merge: {
+    success: boolean
+    order: string[]
+    merged: string[]
+    failed: Array<{
+      branch: string
+      error?: string
+    }>
+    conflicts: string[]
+    error?: string
+  }
+  rows: McpExecutionReportRow[]
+}
+
+export interface WorkspaceDescriptor {
+  id: string
+  mcpId: string
+  branch: string
+  path: string
+}
+
+export const PARALLEL_DIR = '.claude/parallel'
+export const PARALLEL_SESSION_FILE = '.claude/parallel/session.json'
+export const PARALLEL_REPORT_FILE = '.claude/parallel/report.json'
+export const PARALLEL_CONTRACTS_FILE = '.claude/parallel/contracts.json'
+export const PARALLEL_TELEMETRY_FILE = '.claude/parallel/telemetry.json'
+export const PARALLEL_AUDIT_FILE = '.claude/parallel/audit.json'
+export const PARALLEL_WORKSPACES_DIR = '.claude/parallel/workspaces'
