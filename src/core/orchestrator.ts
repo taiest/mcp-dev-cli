@@ -5,6 +5,7 @@ import type {
   McpNodeStatus,
   OrchestratedTask,
   OrchestratedTaskStatus,
+  ParallelProgressEvent,
   ReviewApproval,
   ReviewArtifact,
   SessionPhase,
@@ -33,19 +34,50 @@ export function parseReviewArtifacts(
   const artifacts: ReviewArtifact[] = []
 
   for (const line of lines) {
-    const match = /^REVIEW\s+(APPROVED|CHANGES_REQUESTED)\s+(task-\d+)\s*-\s*(.+)$/i.exec(line)
-    if (!match) continue
+    const structured = /^REVIEW\s+(APPROVED|CHANGES_REQUESTED)\s+(task-\d+)\s*-\s*(.+)$/i.exec(line)
+    if (structured) {
+      artifacts.push({
+        reviewerMcpId: reviewerTask.assignedMcpId,
+        reviewerTaskId: reviewerTask.id,
+        targetTaskId: structured[2],
+        summary: structured[3],
+        approved: structured[1].toUpperCase() === 'APPROVED',
+        timestamp: new Date().toISOString(),
+      })
+      continue
+    }
+
+    const fallback = /(?:current review decision|review decision|当前 review decision)\s*[:：]\s*(?:\*\*)?(task-\d+)(?:\*\*)?\s*[:：-]\s*(?:\*\*)?(approve|approved|request changes|changes requested|rejected)(?:\*\*)?/i.exec(line)
+      || /(?:\*\*)?(task-\d+)(?:\*\*)?\s*[:：-]\s*(?:\*\*)?(approve|approved|request changes|changes requested|rejected)(?:\*\*)?/i.exec(line)
+    if (!fallback) continue
+
+    const decision = fallback[2].toLowerCase()
     artifacts.push({
       reviewerMcpId: reviewerTask.assignedMcpId,
       reviewerTaskId: reviewerTask.id,
-      targetTaskId: match[2],
-      summary: match[3],
-      approved: match[1].toUpperCase() === 'APPROVED',
+      targetTaskId: fallback[1],
+      summary: line,
+      approved: decision === 'approve' || decision === 'approved',
       timestamp: new Date().toISOString(),
     })
   }
 
-  return artifacts
+  if (artifacts.length > 0) return artifacts
+
+  const targetIds = Array.from(new Set((rawOutput.match(/task-\d+/gi) || []).map(item => item.toLowerCase())))
+  const inferredRejected = /(未通过|不通过|需修改|request changes|changes requested|rejected|不能批准)/i.test(rawOutput)
+  const inferredApproved = /(已通过|通过审查|批准|approved)/i.test(rawOutput) && !inferredRejected
+
+  if (targetIds.length === 0 || (!inferredRejected && !inferredApproved)) return []
+
+  return targetIds.map(taskId => ({
+    reviewerMcpId: reviewerTask.assignedMcpId!,
+    reviewerTaskId: reviewerTask.id,
+    targetTaskId: taskId,
+    summary: rawOutput.split('\n').slice(0, 8).join(' ').trim(),
+    approved: inferredApproved,
+    timestamp: new Date().toISOString(),
+  }))
 }
 
 export function approvalsFromArtifacts(artifacts: ReviewArtifact[]): ReviewApproval[] {
@@ -163,8 +195,57 @@ function taskAudit(sessionId: string, task: OrchestratedTask, action: string, st
   })
 }
 
-export function formatFailedBranches(mergeResult: { failedBranches?: Array<{ branch: string; error?: string }> }): string {
+function progressEvent(kind: ParallelProgressEvent['kind'], message: string, partial: Omit<ParallelProgressEvent, 'kind' | 'message' | 'timestamp'> = {}): ParallelProgressEvent {
+  return {
+    kind,
+    message,
+    timestamp: new Date().toISOString(),
+    ...partial,
+  }
+}
+
+function progressTelemetry(session: ExecutionSession, event: ParallelProgressEvent): TelemetryEvent {
+  return {
+    id: `evt-${Date.now()}-${event.kind}-${event.taskId || 'session'}`,
+    timestamp: event.timestamp,
+    sessionId: session.sessionId,
+    mcpId: event.mcpId,
+    taskId: event.taskId,
+    type: event.kind === 'worker' ? 'worker.output' : event.kind === 'task' ? 'task.progress' : `${event.kind}.progress`,
+    message: event.message,
+    durationMs: event.durationMs,
+    activeModel: event.activeModel,
+    metadata: {
+      ...(event.phase ? { phase: String(event.phase) } : {}),
+      ...(event.status ? { status: event.status } : {}),
+      ...(event.snippet ? { snippet: event.snippet } : {}),
+      ...(event.batchId ? { batchId: event.batchId } : {}),
+    },
+  }
+}
+
+function formatFailedBranches(mergeResult: { failedBranches?: Array<{ branch: string; error?: string }> }): string {
   return mergeResult.failedBranches?.map(item => `${item.branch}${item.error ? `(${item.error})` : ''}`).join(', ') || 'none'
+}
+
+function buildReadyRoleSummary(session: ExecutionSession): string {
+  const readyTasks = session.taskGraph.tasks.filter(task => task.status === 'ready')
+  if (readyTasks.length === 0) return 'ready=0 blocked=0'
+
+  const byRole = readyTasks.reduce<Record<string, number>>((acc, task) => {
+    acc[task.roleType] = (acc[task.roleType] || 0) + 1
+    return acc
+  }, {})
+  const roleSummary = Object.entries(byRole)
+    .map(([role, count]) => `${role}:${count}`)
+    .join(', ')
+  return `ready=${readyTasks.length} blocked=${session.taskGraph.tasks.filter(task => task.status === 'blocked').length} roles=${roleSummary}`
+}
+
+function buildRunningMcpSummary(session: ExecutionSession): string {
+  const running = session.mcps.filter(mcp => mcp.status === 'running')
+  if (running.length === 0) return 'running-mcps=0'
+  return `running-mcps=${running.length} ${running.map(mcp => mcp.id).join(', ')}`
 }
 
 export function buildMergeSummaryLines(mergeResult: {
@@ -174,14 +255,14 @@ export function buildMergeSummaryLines(mergeResult: {
   failedBranches?: Array<{ branch: string; error?: string }>
   conflicts?: string[]
   error?: string
-} | null): string[] {
+} | null, label = 'merge'): string[] {
   return [
-    `merge: ${mergeResult ? (mergeResult.success ? 'passed' : 'failed') : 'none'}`,
-    `merge order: ${mergeResult?.mergeOrder?.join(', ') || 'none'}`,
+    `${label}: ${mergeResult ? (mergeResult.success ? 'passed' : 'failed') : 'none'}`,
+    `${label} order: ${mergeResult?.mergeOrder?.join(', ') || 'none'}`,
     `merged branches: ${mergeResult?.mergedBranches?.join(', ') || 'none'}`,
     `failed branches: ${mergeResult ? formatFailedBranches(mergeResult) : 'none'}`,
-    `merge conflicts: ${mergeResult?.conflicts?.join(', ') || 'none'}`,
-    `merge error: ${mergeResult?.error || 'none'}`,
+    `${label} conflicts: ${mergeResult?.conflicts?.join(', ') || 'none'}`,
+    `${label} error: ${mergeResult?.error || 'none'}`,
   ]
 }
 
@@ -197,6 +278,7 @@ export async function executeSessionPipeline(options: {
   mergeFailureFallback: string
   includeGovernanceAuditRecord?: boolean
   includeMergeMetadata?: boolean
+  onProgress?: (event: ParallelProgressEvent, session: ExecutionSession) => void
 }): Promise<ExecutionSession> {
   const runtime = new SessionRuntime(options.projectRoot)
   const scheduler = new Scheduler()
@@ -207,6 +289,11 @@ export async function executeSessionPipeline(options: {
   while (true) {
     running = scheduler.reconcile(running)
     runtime.save(running)
+    options.onProgress?.(progressEvent('session', `phase=${running.phase} runnable scan`, {
+      phase: running.phase,
+      status: running.phase,
+      snippet: buildReadyRoleSummary(running),
+    }), running)
 
     const runnableTasks = getRunnableTasks(running)
     if (runnableTasks.length === 0) break
@@ -221,8 +308,27 @@ export async function executeSessionPipeline(options: {
 
     if (dispatchBatch.length === 0) break
 
+    const batchId = `batch-${Date.now()}`
+    options.onProgress?.(progressEvent('batch', `dispatching ${dispatchBatch.length} tasks`, {
+      phase: running.phase,
+      batchId,
+      status: 'dispatching',
+      snippet: `${dispatchBatch.map(task => `${task.id}@${task.assignedMcpId || 'none'}`).join(', ')} | ${buildRunningMcpSummary(running)}`,
+    }), running)
+
     for (const task of dispatchBatch) {
       running = withTaskRunning(running, task)
+      const taskStarted = progressEvent('task', `${task.id} started on ${task.assignedMcpId || 'none'}`, {
+        phase: running.phase,
+        taskId: task.id,
+        mcpId: task.assignedMcpId,
+        status: 'running',
+      })
+      running = runtime.appendTelemetry(running, {
+        ...progressTelemetry(running, taskStarted),
+        type: 'task.started',
+      })
+      options.onProgress?.(taskStarted, running)
     }
     runtime.save(running)
 
@@ -230,7 +336,19 @@ export async function executeSessionPipeline(options: {
     const results = await Promise.all(
       dispatchBatch.map(async task => {
         const node = batchSnapshot.mcps.find(item => item.id === task.assignedMcpId)
-        const workspace = task.assignedMcpId ? options.workspaces[task.assignedMcpId] : undefined
+        const workspace = (() => {
+          if (task.roleType !== 'reviewer') {
+            return task.assignedMcpId ? options.workspaces[task.assignedMcpId] : undefined
+          }
+
+          const reviewTarget = batchSnapshot.taskGraph.tasks.find(item =>
+            item.reviewRequired
+            && item.status === 'completed'
+            && task.dependencies.includes(item.id)
+            && item.assignedMcpId
+          )
+          return reviewTarget?.assignedMcpId ? options.workspaces[reviewTarget.assignedMcpId] : (task.assignedMcpId ? options.workspaces[task.assignedMcpId] : undefined)
+        })()
         if (!node || !workspace) {
           return {
             task,
@@ -242,7 +360,11 @@ export async function executeSessionPipeline(options: {
           }
         }
 
-        const result = await worker.run(batchSnapshot.sessionId, node, task, workspace, options.contracts, options.context)
+        const result = await worker.run(batchSnapshot, node, task, workspace, options.contracts, options.context, event => {
+          const telemetry = progressTelemetry(batchSnapshot, event)
+          running = runtime.appendTelemetry(running, telemetry)
+          options.onProgress?.(event, running)
+        })
         return { task, result }
       })
     )
@@ -254,9 +376,28 @@ export async function executeSessionPipeline(options: {
       running = runtime.appendAudit(running, [
         taskAudit(running.sessionId, task, options.taskAction, result.success ? 'passed' : 'failed', result.telemetry.message),
       ])
+      const taskFinished = progressEvent('task', `${task.id} ${nextStatus}`, {
+        phase: running.phase,
+        taskId: task.id,
+        mcpId: task.assignedMcpId,
+        status: nextStatus,
+        durationMs: result.telemetry.durationMs,
+      })
+      running = runtime.appendTelemetry(running, {
+        ...progressTelemetry(running, taskFinished),
+        type: nextStatus === 'completed' ? 'task.completed' : 'task.failed',
+      })
+      options.onProgress?.(taskFinished, running)
       running = scheduler.reconcile(running)
       runtime.save(running)
     }
+
+    options.onProgress?.(progressEvent('batch', `completed ${dispatchBatch.length} tasks`, {
+      phase: running.phase,
+      batchId,
+      status: 'completed',
+      snippet: dispatchBatch.map(task => task.id).join(', '),
+    }), running)
   }
 
   const reviewArtifacts = parseReviewArtifacts(running.artifacts, running.taskGraph.tasks)
@@ -268,11 +409,30 @@ export async function executeSessionPipeline(options: {
   })
 
   const governanceAudit = policy.buildGovernanceAudit(running, running.reviewAssignments || [], reviewApprovals)
+  options.onProgress?.(progressEvent('merge', 'running quality gate', {
+    phase: running.phase,
+    status: 'quality-gate',
+  }), running)
   const qualityGate = await new QualityGate().runAll(options.projectRoot, running, reviewApprovals)
+  options.onProgress?.(progressEvent('merge', 'running merge step', {
+    phase: running.phase,
+    status: 'merging',
+  }), running)
   const mergeResult = await new GitMergeService(options.projectRoot).merge(running, options.workspaces)
   const recovery = !mergeResult.success
     ? await new FailureRecovery(options.projectRoot).recover(running, mergeResult.error || 'merge failed', options.workspaces)
     : []
+
+  if (recovery.length > 0) {
+    for (const item of recovery) {
+      options.onProgress?.(progressEvent('recovery', `${item.step}: ${item.suggestion || item.message}`, {
+        phase: running.phase,
+        status: item.status,
+        taskId: item.taskId,
+        mcpId: item.mcpId,
+      }), running)
+    }
+  }
 
   const failed = running.taskGraph.tasks.filter(task => task.status === 'failed').length
   const finalPhase: SessionPhase = failed > 0 || !qualityGate.passed || !mergeResult.success
@@ -335,5 +495,10 @@ export async function executeSessionPipeline(options: {
     },
   }, auditRecords)
   runtime.save(finalSession)
+  options.onProgress?.(progressEvent('session', `session ${finalPhase}`, {
+    phase: finalPhase,
+    status: finalPhase,
+    snippet: mergeResult.success ? 'merge passed' : mergeResult.error || 'merge failed',
+  }), finalSession)
   return finalSession
 }

@@ -342,6 +342,10 @@ export interface StartupFlowState {
   recentSessions: SessionHistoryEntry[]
   templates: StartupTemplate[]
   entries: {
+    approve: {
+      available: boolean
+      reason?: string
+    }
     newSession: {
       available: boolean
       reason?: string
@@ -355,7 +359,15 @@ export interface StartupFlowState {
       reason?: string
     }
   }
-  recommendedEntry: 'new' | 'resume' | 'template'
+  connectionStatus: 'connected'
+  developmentStatus: 'ready' | 'blocked' | 'resumable' | 'approval_required'
+  canAcceptRequirement: boolean
+  requirementPrompt?: string
+  recommendedEntry: 'approve' | 'new' | 'resume' | 'template'
+  summary: string
+  recommendedAction: string
+  recommendedReason: string
+  nextActions: string[]
   steps: StartupFlowStep[]
 }
 
@@ -391,6 +403,20 @@ export interface TelemetryEvent {
   totalTokens?: number
   activeModel?: string
   metadata?: Record<string, string>
+}
+
+export interface ParallelProgressEvent {
+  kind: 'session' | 'batch' | 'task' | 'worker' | 'merge' | 'recovery'
+  message: string
+  phase?: SessionPhase | string
+  taskId?: string
+  mcpId?: string
+  status?: string
+  snippet?: string
+  batchId?: string
+  timestamp: string
+  durationMs?: number
+  activeModel?: string
 }
 
 export interface ReviewApproval {
@@ -499,6 +525,7 @@ export interface MonitoringSummary {
 
 export interface ExecutionSummaryReport {
   sessionId: string
+  requirement?: string
   totalDurationMs: number
   totalTokens: number
   completedCount: number

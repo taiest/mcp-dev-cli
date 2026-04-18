@@ -92,6 +92,7 @@ export class MetricsAggregator {
 
     return {
       sessionId: session.sessionId,
+      requirement: session.requirement,
       totalDurationMs,
       totalTokens,
       completedCount: session.taskGraph.tasks.filter(task => task.status === 'completed').length,

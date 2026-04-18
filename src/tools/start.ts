@@ -9,5 +9,9 @@ export async function startDev(requirement: string, projectRoot: string): Promis
   }
 
   await initProjectApp(projectRoot)
-  return startParallelSession(requirement, projectRoot)
+  return [
+    '已完成必要初始化，开始分配任务、创建角色并启动多 MCP 开发流程。',
+    '',
+    await startParallelSession(requirement, projectRoot),
+  ].join('\n')
 }

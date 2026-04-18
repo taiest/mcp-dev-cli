@@ -34,13 +34,13 @@ export class WorkspaceManager {
   async mergeByController(
     workspaces: Record<string, WorkspaceDescriptor>,
     controllerWorkspace: WorkspaceDescriptor,
-    baseBranch: string,
+    _baseBranch: string,
     branchOrder: string[]
   ): Promise<{ merged: string[]; failed: Array<{ branch: string; error?: string }> }> {
     const merged: string[] = []
     const failed: Array<{ branch: string; error?: string }> = []
 
-    await this.worktree.checkoutBranch(controllerWorkspace, baseBranch)
+    await this.worktree.checkoutBranch(controllerWorkspace, controllerWorkspace.branch)
 
     for (const branch of branchOrder) {
       if (branch === controllerWorkspace.branch) continue

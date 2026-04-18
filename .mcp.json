@@ -1,8 +1,13 @@
 {
   "mcpServers": {
-    "filesystem": {
+    "mcp-dev-cli": {
+      "type": "stdio",
       "command": "npx",
-      "args": ["-y", "@anthropic/mcp-filesystem", "/Users/taiest/Documents/code/mcp-dev-cli"]
+      "args": [
+        "-y",
+        "mcp-dev-cli"
+      ],
+      "env": {}
     }
   }
 }

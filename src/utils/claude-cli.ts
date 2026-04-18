@@ -13,12 +13,20 @@ export interface ClaudeOptions {
   noSessionPersistence?: boolean
   cwd?: string
   bare?: boolean
+  permissionMode?: 'acceptEdits' | 'auto' | 'bypassPermissions' | 'default' | 'dontAsk' | 'plan'
+  dangerouslySkipPermissions?: boolean
 }
 
 export interface ClaudeAdapter {
   run(options: ClaudeOptions): Promise<string>
   spawn(options: ClaudeOptions): ResultPromise
   checkInstalled(): Promise<boolean>
+}
+
+export interface ClaudeRegisterMcpResult {
+  added: boolean
+  alreadyExists: boolean
+  message: string
 }
 
 function buildArgs(options: ClaudeOptions): string[] {
@@ -54,6 +62,12 @@ function buildArgs(options: ClaudeOptions): string[] {
   if (options.bare) {
     args.push('--bare')
   }
+  if (options.permissionMode) {
+    args.push('--permission-mode', options.permissionMode)
+  }
+  if (options.dangerouslySkipPermissions) {
+    args.push('--dangerously-skip-permissions')
+  }
 
   return args
 }
@@ -79,6 +93,8 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       cwd: options.cwd,
       reject: false,
       timeout: 1_800_000,
+      input: undefined,
+      stdin: 'ignore',
     })
   }
 
@@ -90,7 +106,6 @@ export class ClaudeCliAdapter implements ClaudeAdapter {
       return false
     }
   }
-
 }
 
 const defaultAdapter = new ClaudeCliAdapter()
@@ -107,3 +122,29 @@ export async function checkClaudeInstalled(): Promise<boolean> {
   return defaultAdapter.checkInstalled()
 }
 
+export async function registerProjectMcpServer(projectRoot: string): Promise<ClaudeRegisterMcpResult> {
+  const result = await execa('claude', ['mcp', 'add', 'mcp-dev-cli', '--scope', 'project', '--', 'npx', '-y', 'mcp-dev-cli'], {
+    cwd: projectRoot,
+    reject: false,
+    timeout: 120_000,
+  })
+
+  const output = [result.stdout, result.stderr].filter(Boolean).join('\n').trim()
+  if (result.exitCode === 0) {
+    return {
+      added: true,
+      alreadyExists: false,
+      message: output || 'mcp-dev-cli project MCP server added',
+    }
+  }
+
+  if (/already exists/i.test(output)) {
+    return {
+      added: false,
+      alreadyExists: true,
+      message: output,
+    }
+  }
+
+  throw new Error(output || `claude mcp add exited with code ${result.exitCode}`)
+}

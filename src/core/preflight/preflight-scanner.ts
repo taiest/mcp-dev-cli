@@ -3,7 +3,8 @@ import { runGitCheck } from './checks/git-check.js'
 import { runClaudeCheck } from './checks/claude-check.js'
 import { runNodeCheck } from './checks/node-check.js'
 import { runBuildCheck } from './checks/build-check.js'
-import { hasClaudeMd, hasMcpConfig, hasParallelPlatform } from '../../utils/platform.js'
+import { hasClaudeMd, hasParallelPlatform } from '../../utils/platform.js'
+import { inspectProjectMcpConfig } from '../../utils/mcp-config.js'
 
 function runNetworkCheck(): PreflightCheckResult {
   return {
@@ -13,6 +14,62 @@ function runNetworkCheck(): PreflightCheckResult {
     autoFixable: false,
     category: 'network',
     currentState: 'ready',
+  }
+}
+
+function buildMcpConfigCheck(projectRoot: string): ProjectConfigCheck {
+  const inspection = inspectProjectMcpConfig(projectRoot)
+
+  if (!inspection.exists) {
+    return {
+      name: 'mcp-config',
+      status: 'warning',
+      message: '缺少 .mcp.json，当前项目还未接入 mcp-dev-cli',
+      path: '.mcp.json',
+      autoFixable: false,
+      nextStep: '在项目目录执行 npx -y mcp-dev-cli install 完成一键接入。',
+    }
+  }
+
+  if (inspection.parseError) {
+    return {
+      name: 'mcp-config',
+      status: 'warning',
+      message: '.mcp.json 存在但无法解析',
+      path: '.mcp.json',
+      autoFixable: false,
+      nextStep: '在项目目录执行 npx -y mcp-dev-cli install 重建正确接入配置。',
+    }
+  }
+
+  if (inspection.valid) {
+    return {
+      name: 'mcp-config',
+      status: 'passed',
+      message: 'mcp-dev-cli 已正确接入 Claude Code',
+      path: '.mcp.json',
+      autoFixable: false,
+    }
+  }
+
+  if (inspection.hasLegacyFilesystemServer) {
+    return {
+      name: 'mcp-config',
+      status: 'warning',
+      message: '.mcp.json 仍是旧的 filesystem 模板，不是 mcp-dev-cli 接入配置',
+      path: '.mcp.json',
+      autoFixable: false,
+      nextStep: '在项目目录执行 npx -y mcp-dev-cli install 自动修正配置。',
+    }
+  }
+
+  return {
+    name: 'mcp-config',
+    status: 'warning',
+    message: '.mcp.json 已存在，但没有正确声明 mcp-dev-cli',
+    path: '.mcp.json',
+    autoFixable: false,
+    nextStep: '在项目目录执行 npx -y mcp-dev-cli install 自动写入标准接入配置。',
   }
 }
 
@@ -67,22 +124,7 @@ export class PreflightScanner {
             fixAction: 'parallel_init',
             nextStep: '执行 parallel_init 生成默认 CLAUDE.md 模板。',
           },
-      hasMcpConfig(projectRoot)
-        ? {
-            name: 'mcp-config',
-            status: 'passed',
-            message: '.mcp.json 已存在',
-            path: '.mcp.json',
-            autoFixable: false,
-          }
-        : {
-            name: 'mcp-config',
-            status: 'warning',
-            message: '缺少 .mcp.json，当前项目未声明 MCP server 接入',
-            path: '.mcp.json',
-            autoFixable: false,
-            nextStep: '按 README 配置 .mcp.json，或使用 claude mcp add 完成项目级接入。',
-          },
+      buildMcpConfigCheck(projectRoot),
     ]
 
     return {

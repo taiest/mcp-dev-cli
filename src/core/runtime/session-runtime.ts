@@ -1,5 +1,6 @@
 import type {
   AuditRecord,
+  ContractArtifact,
   ExecutionSession,
   ExecutionSummaryReport,
   McpNode,
@@ -67,7 +68,14 @@ export class SessionRuntime {
   }
 
   load(): ExecutionSession | null {
-    return this.store.loadSession()
+    const session = this.store.loadSession()
+    if (!session) return null
+
+    const normalized = this.normalizeSessionContracts(session)
+    if (JSON.stringify(normalized.contracts) !== JSON.stringify(session.contracts)) {
+      this.store.saveSession(normalized)
+    }
+    return normalized
   }
 
   save(session: ExecutionSession): void {
@@ -124,13 +132,17 @@ export class SessionRuntime {
     const recentSessions = this.store.listSessionHistory()
     const templates = this.store.listStartupTemplates()
     const activeSession = this.load()
-    const hasResumable = recentSessions.some(item => item.resumable) || (activeSession ? activeSession.phase !== 'completed' : false)
-    const canStartNew = discovery.hasGit && config.passed && preflight.passed
+    const requiresApproval = Boolean(activeSession && activeSession.phase === 'planning')
+    const hasResumable = recentSessions.some(item => item.resumable) || (activeSession ? activeSession.phase !== 'completed' && activeSession.phase !== 'planning' : false)
+    const canStartNew = discovery.hasGit && config.passed && preflight.passed && !requiresApproval
 
     const entries = {
+      approve: requiresApproval
+        ? { available: true }
+        : { available: false, reason: '当前没有待审批的 planning session。' },
       newSession: canStartNew
         ? { available: true }
-        : { available: false, reason: '存在未通过的 discovery/config/preflight 项，需要先修复。' },
+        : { available: false, reason: requiresApproval ? '当前已有待审批 session，需先 approve 再执行。' : '存在未通过的 discovery/config/preflight 项，需要先修复。' },
       resume: hasResumable
         ? { available: true }
         : { available: false, reason: '当前没有可继续的 session。' },
@@ -169,11 +181,75 @@ export class SessionRuntime {
       {
         key: 'launch',
         title: 'Launch readiness',
-        status: canStartNew ? 'ready' : 'warning',
-        message: canStartNew ? '可以直接启动新 session。' : '先处理 warning/failed 项，再启动新 session。',
+        status: requiresApproval ? 'warning' : canStartNew ? 'ready' : 'warning',
+        message: requiresApproval
+          ? '当前已有 planning session，需先审批后才能进入执行。'
+          : canStartNew
+            ? '可以直接启动新 session。'
+            : '先处理 warning/failed 项，再启动新 session。',
         blocking: !canStartNew,
+        nextStep: requiresApproval ? '运行 parallel_approve 进入主控执行。' : undefined,
       },
     ]
+
+    const recommendedEntry: StartupFlowState['recommendedEntry'] = requiresApproval
+      ? 'approve'
+      : entries.resume.available
+        ? 'resume'
+        : entries.newSession.available
+          ? 'new'
+          : 'template'
+    const shouldInitFirst = !discovery.initialized
+    const developmentStatus: StartupFlowState['developmentStatus'] = requiresApproval
+      ? 'approval_required'
+      : entries.resume.available
+        ? 'resumable'
+        : canStartNew && !shouldInitFirst
+          ? 'ready'
+          : 'blocked'
+    const canAcceptRequirement = developmentStatus === 'ready'
+    const requirementPrompt = canAcceptRequirement
+      ? '已连接并可开始开发。请直接在对话框输入需求并回车，然后调用 parallel_start。'
+      : undefined
+    const summary = !discovery.hasGit
+      ? '当前目录还不是可用的 Git 项目，先修正项目根目录。'
+      : requiresApproval
+        ? '检测到待审批的 planning session，先确认执行计划再进入主控执行。'
+        : entries.resume.available
+          ? '检测到可恢复 session，优先回到已有工作流继续推进。'
+          : shouldInitFirst
+            ? '当前仓库还没完成 parallel 平台初始化，建议先补齐基础结构再启动 session。'
+            : entries.newSession.available
+              ? '当前项目已准备就绪，可以直接启动新的并行 session。'
+              : entries.template.available
+                ? '当前不适合直接启动，先从模板或修复建议入手。'
+                : '当前项目还有阻塞项，先处理 startup / preflight 提示。'
+    const recommendedAction = requiresApproval
+      ? 'parallel_approve'
+      : entries.resume.available
+        ? 'parallel_resume'
+        : shouldInitFirst
+          ? 'parallel_init'
+          : recommendedEntry === 'new'
+            ? 'parallel_start'
+            : 'parallel_init'
+    const recommendedReason = requiresApproval
+      ? '已有需求拆解与任务分配结果，先审批后执行可保持主控流清晰。'
+      : entries.resume.available
+        ? '已有未完成 session，可直接恢复当前进度。'
+        : shouldInitFirst
+          ? '当前仓库缺少 parallel 平台目录或基础初始化文件，先初始化更稳妥。'
+          : recommendedEntry === 'new'
+            ? 'discovery、config、preflight 已满足启动条件。'
+            : entries.template.reason || entries.newSession.reason || '当前更适合先初始化或修复阻塞项。'
+    const nextActions = [
+      recommendedAction,
+      ...(requiresApproval ? ['parallel_dashboard'] : []),
+      ...(!discovery.initialized ? ['parallel_init'] : []),
+      ...(!config.passed || !preflight.passed ? ['parallel_preflight'] : []),
+      ...(entries.resume.available && !requiresApproval ? ['parallel_dashboard'] : []),
+      ...(recommendedAction !== 'parallel_start' && entries.newSession.available ? ['parallel_start'] : []),
+    ].filter((action, index, list) => list.indexOf(action) === index)
 
     return {
       projectRoot: this.projectRoot,
@@ -183,7 +259,15 @@ export class SessionRuntime {
       recentSessions,
       templates,
       entries,
-      recommendedEntry: entries.resume.available ? 'resume' : entries.newSession.available ? 'new' : 'template',
+      connectionStatus: 'connected',
+      developmentStatus,
+      canAcceptRequirement,
+      requirementPrompt,
+      recommendedEntry,
+      summary,
+      recommendedAction,
+      recommendedReason,
+      nextActions,
       steps,
     }
   }
@@ -199,6 +283,61 @@ export class SessionRuntime {
       hasParallelDir: hasParallelPlatform(this.projectRoot),
       stack: detectTechStack(this.projectRoot).frameworks,
     }
+  }
+
+  private normalizeSessionContracts(session: ExecutionSession): ExecutionSession {
+    const fallbackProducerTaskId = session.taskGraph.tasks.find(task => task.roleType === 'architect' || task.roleType === 'developer')?.id
+      || session.taskGraph.tasks[0]?.id
+      || 'manual'
+    const fallbackConsumerTaskIds = session.taskGraph.tasks
+      .map(task => task.id)
+      .filter(taskId => taskId !== fallbackProducerTaskId)
+
+    return {
+      ...session,
+      contracts: session.contracts.map(contract => {
+        const producerTaskId = contract.producerTaskId !== 'manual' && contract.producerTaskId
+          ? contract.producerTaskId
+          : fallbackProducerTaskId
+        const consumerTaskIds = contract.consumerTaskIds.length > 0
+          ? contract.consumerTaskIds
+          : fallbackConsumerTaskIds
+        const content = normalizeContractContent(contract, producerTaskId)
+
+        return {
+          ...contract,
+          producerTaskId,
+          consumerTaskIds,
+          content,
+          validationStatus: contract.validationStatus === 'invalid' ? 'invalid' : 'valid',
+        }
+      }),
+    }
+  }
+}
+
+function normalizeContractContent(contract: ContractArtifact, producerTaskId: string): string {
+  try {
+    const parsed = JSON.parse(contract.content) as {
+      ownerTaskId?: string
+      version?: number
+      summary?: string
+      kind?: 'delivery' | 'api'
+    }
+
+    return JSON.stringify({
+      ownerTaskId: producerTaskId,
+      version: contract.version,
+      summary: parsed.summary || contract.name || 'migrated contract',
+      kind: parsed.kind === 'api' ? 'api' : 'delivery',
+    })
+  } catch {
+    return JSON.stringify({
+      ownerTaskId: producerTaskId,
+      version: contract.version,
+      summary: contract.content || contract.name || 'migrated contract',
+      kind: 'delivery',
+    })
   }
 }
 

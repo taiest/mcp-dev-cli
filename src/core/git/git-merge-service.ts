@@ -15,6 +15,42 @@ function formatWorkspaceState(conflicts: string[]): string {
   return conflicts.join(', ') || 'repository state blocked merge'
 }
 
+function governanceMergeFailure(session: ExecutionSession): MergeResult {
+  const governanceStatus = session.governance?.status || 'pending'
+  const reviewTaskIds = session.governance?.reviewRequiredTaskIds || []
+
+  if (governanceStatus === 'review_rejected') {
+    return {
+      success: false,
+      conflicts: reviewTaskIds,
+      error: 'governance gate prevents merge: review rejected',
+      mergeOrder: [],
+      mergedBranches: [],
+      failedBranches: reviewTaskIds.map(taskId => ({ branch: taskId, error: 'review rejected' })),
+    }
+  }
+
+  if (governanceStatus === 'waiting_approval' || governanceStatus === 'review_assigned' || governanceStatus === 'review_required') {
+    return {
+      success: false,
+      conflicts: reviewTaskIds,
+      error: 'governance gate prevents merge: review approvals not complete',
+      mergeOrder: [],
+      mergedBranches: [],
+      failedBranches: reviewTaskIds.map(taskId => ({ branch: taskId, error: 'review approval pending' })),
+    }
+  }
+
+  return {
+    success: false,
+    conflicts: reviewTaskIds,
+    error: `governance gate prevents merge: ${governanceStatus}`,
+    mergeOrder: [],
+    mergedBranches: [],
+    failedBranches: reviewTaskIds.map(taskId => ({ branch: taskId, error: governanceStatus })),
+  }
+}
+
 export class GitMergeService {
   constructor(private projectRoot: string) {}
 
@@ -44,15 +80,20 @@ export class GitMergeService {
       }
     }
 
-    if (!session.governance?.readyForMerge) {
+    const reviewRequiredTaskIds = session.governance?.reviewRequiredTaskIds || []
+    if (reviewRequiredTaskIds.length === 0) {
       return {
-        success: false,
-        conflicts: session.governance?.reviewRequiredTaskIds || [],
-        error: 'governance gate prevents merge: review approvals not complete',
+        success: true,
+        conflicts: [],
+        error: undefined,
         mergeOrder: [],
         mergedBranches: [],
-        failedBranches: (session.governance?.reviewRequiredTaskIds || []).map(taskId => ({ branch: taskId, error: 'review approval missing' })),
+        failedBranches: [],
       }
+    }
+
+    if (!session.governance?.readyForMerge) {
+      return governanceMergeFailure(session)
     }
 
     const workspaceManager = new WorkspaceManager(this.projectRoot)

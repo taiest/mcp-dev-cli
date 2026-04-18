@@ -1,6 +1,7 @@
 import { execa } from 'execa'
 import type { ExecutionSession, PreflightReport, ReviewApproval, ReviewAssignment } from '../../types.js'
 import { getQualityCommands } from '../../utils/platform.js'
+import { isReadOnlyValidationText } from '../worker/validation-task.js'
 
 async function runCommands(commands: string[], projectRoot: string): Promise<boolean> {
   if (commands.length === 0) return true
@@ -29,7 +30,21 @@ function reviewPassed(assignments: ReviewAssignment[] = [], approvals: ReviewApp
 }
 
 export class QualityGate {
-  async runAll(projectRoot: string, session: Pick<ExecutionSession, 'reviewAssignments'>, approvals: ReviewApproval[] = []): Promise<PreflightReport> {
+  async runAll(projectRoot: string, session: Pick<ExecutionSession, 'requirement' | 'reviewAssignments'>, approvals: ReviewApproval[] = []): Promise<PreflightReport> {
+    if (isReadOnlyValidationText(session.requirement)) {
+      return {
+        passed: true,
+        checks: [
+          {
+            name: 'quality:validation',
+            status: 'passed',
+            message: '只读 validation session 跳过常规质量门禁',
+            autoFixable: false,
+          },
+        ],
+      }
+    }
+
     const commands = getQualityCommands(projectRoot)
     const [testsPassed, lintPassed, securityPassed] = await Promise.all([
       runCommands(commands.test, projectRoot),

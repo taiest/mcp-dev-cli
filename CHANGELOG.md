@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.1 (2026-04-18)
+
+### Fixes
+- 新增 `mcp-dev-cli install` 一键安装并接入命令，自动注册项目级 MCP server
+- 修复 `.mcp.json` 模板仍写入旧 `filesystem` server 的问题，统一改为 `mcp-dev-cli`
+- preflight/startup 现在会校验 MCP 接入是否正确，而不是只检查 `.mcp.json` 是否存在
+- README 主路径更新为一条命令安装并接入，然后在 `/mcp` 中选择 `mcp-dev-cli`
+
 ## v0.5.0 (2026-04-16)
 
 ### New Features

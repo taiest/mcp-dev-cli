@@ -4,7 +4,15 @@ export function getStatus(projectRoot: string): string {
   const session = new SessionRuntime(projectRoot).load()
 
   if (!session) {
-    return ['📊 Parallel session 状态', '━'.repeat(40), '当前没有进行中的 parallel session。使用 parallel_start 开始新任务。'].join('\n')
+    return [
+      '📊 Parallel session 状态',
+      '━'.repeat(40),
+      '当前没有进行中的 parallel session。',
+      '',
+      '建议下一步：',
+      '- 先运行 parallel_startup，判断当前项目应该 start 还是 resume。',
+      '- 如果你已经确认项目环境就绪，也可以直接运行 parallel_start 开始新任务。',
+    ].join('\n')
   }
 
   const completed = session.taskGraph.tasks.filter(task => task.status === 'completed').length
@@ -35,7 +43,7 @@ export function getStatus(projectRoot: string): string {
 
   if (session.phase !== 'completed') {
     lines.push('')
-    lines.push('使用 parallel_resume 继续执行')
+    lines.push('建议下一步：使用 parallel_dashboard 查看当前进度，或使用 parallel_resume 继续执行。')
   }
 
   return lines.join('\n')

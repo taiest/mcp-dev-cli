@@ -1,22 +1,23 @@
+import { mkdirSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import type {
   ContractArtifact,
   ExecutionSession,
   GovernancePolicy,
-  McpNode,
-  MergeResult,
   ModelPolicy,
+  McpNode,
 } from '../types.js'
+import { AGENTS_DIR } from '../types.js'
 import { PreflightScanner } from '../core/preflight/preflight-scanner.js'
 import { SessionRuntime } from '../core/runtime/session-runtime.js'
 import { TaskGraphBuilder } from '../core/scheduler/task-graph.js'
 import { Scheduler } from '../core/scheduler/scheduler.js'
-import { WorkspaceManager } from '../core/workspace/workspace-manager.js'
-import { buildContextSummary } from '../core/context/context-summary.js'
 import { StackPolicyEngine } from '../core/policy/stack-policy-engine.js'
 import { PolicyEngine } from '../core/policy/policy-engine.js'
 import { ContractValidator } from '../core/contracts/contract-validator.js'
 import { createAuditRecord } from '../core/telemetry/audit-trail.js'
-import { buildMergeSummaryLines, executeSessionPipeline } from '../core/orchestrator.js'
+import { buildDashboardView } from '../core/report/dashboard-view.js'
+import { renderExecutionPlan, renderSessionOutcome } from '../core/terminal/renderers.js'
 
 function defaultPolicy(): ModelPolicy {
   return {
@@ -84,20 +85,25 @@ function buildDefaultMcps(count: number): McpNode[] {
 function buildBootstrapContracts(tasks: Array<{ id: string; roleType: string }>): ContractArtifact[] {
   return tasks
     .filter(task => task.roleType === 'architect' || task.roleType === 'developer')
-    .map((task, index) => ({
-      id: `contract:${task.id}`,
-      name: `${task.roleType}-contract-${index + 1}`,
-      producerTaskId: task.id,
-      consumerTaskIds: tasks.filter(other => other.id !== task.id).map(other => other.id),
-      version: 1,
-      content: JSON.stringify({
-        ownerTaskId: task.id,
+    .map((task, index) => {
+      const consumerTaskIds = tasks.filter(other => other.id !== task.id).map(other => other.id)
+      if (consumerTaskIds.length === 0) return null
+      return {
+        id: `contract:${task.id}`,
+        name: `${task.roleType}-contract-${index + 1}`,
+        producerTaskId: task.id,
+        consumerTaskIds,
         version: 1,
-        summary: `Contract owned by ${task.id} for ${task.roleType}`,
-        kind: task.roleType === 'architect' ? 'api' : 'delivery',
-      }),
-      validationStatus: 'valid',
-    }))
+        content: JSON.stringify({
+          ownerTaskId: task.id,
+          version: 1,
+          summary: `Contract owned by ${task.id} for ${task.roleType}`,
+          kind: task.roleType === 'architect' ? 'api' : 'delivery',
+        }),
+        validationStatus: 'valid',
+      }
+    })
+    .filter((contract): contract is ContractArtifact => Boolean(contract))
 }
 
 function attachContractsToTasks(session: ExecutionSession): ExecutionSession {
@@ -126,6 +132,48 @@ function attachContractsToTasks(session: ExecutionSession): ExecutionSession {
       }),
     },
   }
+}
+
+function agentFileName(mcp: McpNode): string {
+  return `${mcp.name}.md`
+}
+
+export function createAgentFiles(projectRoot: string, session: ExecutionSession): Array<{ mcpId: string; file: string; role: string; tasks: string[] }> {
+  const agentsRoot = join(projectRoot, AGENTS_DIR)
+  mkdirSync(agentsRoot, { recursive: true })
+
+  return session.mcps.map(mcp => {
+    const tasks = session.taskGraph.tasks
+      .filter(task => task.assignedMcpId === mcp.id)
+      .map(task => `${task.id} ${task.title}`)
+    const file = agentFileName(mcp)
+    const content = [
+      `# ${mcp.name}`,
+      '',
+      `- MCP: ${mcp.id}`,
+      `- Role: ${mcp.roleType}`,
+      `- Model: ${mcp.activeModel}`,
+      `- Workspace: ${mcp.workspaceId}`,
+      `- Session: ${session.sessionId}`,
+      '',
+      '## Assigned Tasks',
+      '',
+      ...(tasks.length > 0 ? tasks.map(item => `- ${item}`) : ['- waiting for assignment']),
+    ].join('\n')
+    writeFileSync(join(agentsRoot, file), content, 'utf-8')
+    return { mcpId: mcp.id, file, role: mcp.roleType, tasks }
+  })
+}
+
+export function summarizeAssignments(session: ExecutionSession): string[] {
+  return session.mcps.map(mcp => {
+    const tasks = session.taskGraph.tasks.filter(task => task.assignedMcpId === mcp.id)
+    return `${mcp.id} [${mcp.roleType}] ${tasks.map(task => `${task.id}:${task.title}`).join(', ') || 'waiting'}`
+  })
+}
+
+export function summarizeCreatedRoles(roles: Array<{ mcpId: string; file: string; role: string; tasks: string[] }>): string[] {
+  return roles.map(role => `${role.mcpId} -> .claude/agents/${role.file} [${role.role}] ${role.tasks.length > 0 ? `${role.tasks.length} tasks` : 'waiting'}`)
 }
 
 export async function startParallelSession(requirement: string, projectRoot: string, mcpCount = 6): Promise<string> {
@@ -175,93 +223,49 @@ export async function startParallelSession(requirement: string, projectRoot: str
       }),
     ])
     runtime.save(blockedSession)
-    return [
-      `❌ session blocked: ${scheduled.sessionId}`,
-      ...preflight.checks.map(check => `- ${check.name}: ${check.status} ${check.message}`),
-      `- ${stackGate.name}: ${stackGate.status} ${stackGate.message}`,
-      ...policyGate.checks.map(check => `- ${check.name}: ${check.status} ${check.message}`),
-      ...contractGate.checks.map(check => `- ${check.name}: ${check.status} ${check.message}`),
-    ].join('\n')
+    return renderSessionOutcome({
+      action: 'blocked',
+      sessionId: scheduled.sessionId,
+      phase: 'failed',
+      summary: [
+        ['preflight', preflight.passed ? 'passed' : 'failed'],
+        ['stack policy', stackGate.status],
+        ['policy gate', policyGate.passed ? 'passed' : 'failed'],
+        ['contract gate', contractGate.passed ? 'passed' : 'failed'],
+      ],
+      sections: [
+        {
+          title: 'Checks',
+          lines: [
+            ...preflight.checks.map(check => `${check.name}: ${check.status} ${check.message}`),
+            `${stackGate.name}: ${stackGate.status} ${stackGate.message}`,
+            ...policyGate.checks.map(check => `${check.name}: ${check.status} ${check.message}`),
+            ...contractGate.checks.map(check => `${check.name}: ${check.status} ${check.message}`),
+          ],
+        },
+      ],
+      nextStep: 'Run parallel_preflight and resolve failed checks before starting a new session.',
+    })
   }
 
-  const workspaceManager = new WorkspaceManager(projectRoot)
-  const workspaces = await workspaceManager.prepare(scheduled)
-  const running = runtime.appendAudit({
+  const planned: ExecutionSession = {
     ...scheduled,
-    phase: 'running',
+    phase: 'planning',
     contracts,
     contractGate,
     governanceAudit: policy.buildGovernanceAudit(scheduled, scheduled.reviewAssignments || []),
     artifacts: {
       ...scheduled.artifacts,
-      workspaceMap: JSON.stringify(workspaces, null, 2),
       stackPolicy: JSON.stringify(stackGate, null, 2),
       policyGate: JSON.stringify(policyGate, null, 2),
+      assignmentSummary: JSON.stringify(summarizeAssignments(scheduled), null, 2),
     },
-  }, [
-    createAuditRecord({
-      sessionId: session.sessionId,
-      scope: 'session',
-      action: 'launch-workspaces',
-      status: 'passed',
-      actor: session.controllerMcpId,
-      message: 'parallel workspaces prepared',
-      metadata: {
-        workspaceCount: String(Object.keys(workspaces).length),
-      },
-    }),
-  ])
-  runtime.save(running)
+    resumeCursor: {
+      phase: 'planning',
+      taskIds: scheduled.taskGraph.tasks.map(task => task.id),
+    },
+  }
+  runtime.save(planned)
 
-  const context = buildContextSummary({
-    goal: requirement,
-    constraints: [`技术栈必须保持: ${running.stack.join(', ') || 'unknown'}`],
-    analysis: 'parallel execution in progress',
-    plan: running.taskGraph.tasks.map(task => `${task.id}:${task.title}`).join('\n'),
-    risks: stackGate.status === 'passed' ? [] : [stackGate.message],
-    nextSteps: [],
-    phase: running.phase,
-  })
-
-  const finalSession = await executeSessionPipeline({
-    projectRoot,
-    session: running,
-    workspaces,
-    contracts,
-    context,
-    taskAction: 'task-execution',
-    mergeAction: 'merge-session',
-    mergeSuccessMessage: 'merge completed',
-    mergeFailureFallback: 'merge failed',
-    includeGovernanceAuditRecord: true,
-    includeMergeMetadata: true,
-  })
-
-  const mergeResult = finalSession.artifacts.mergeResult
-    ? JSON.parse(finalSession.artifacts.mergeResult) as MergeResult
-    : null
-  const failed = finalSession.taskGraph.tasks.filter(task => task.status === 'failed').length
-  const completed = finalSession.taskGraph.tasks.filter(task => task.status === 'completed').length
-  const reviewArtifacts = finalSession.reviewArtifacts || []
-  const recovery = finalSession.recovery || []
-
-  return [
-    `✅ started parallel session: ${finalSession.sessionId}`,
-    `phase: ${finalSession.phase}`,
-    `controller: ${finalSession.controllerMcpId}`,
-    `governance: ${finalSession.governance?.status || 'pending'}`,
-    `preflight: passed`,
-    `stack-policy: ${stackGate.status}`,
-    `policy-gate: ${policyGate.passed ? 'passed' : 'failed'}`,
-    `contracts: ${contractGate.passed ? 'passed' : 'failed'}`,
-    `review-artifacts: ${reviewArtifacts.length}`,
-    `review-assignments: ${finalSession.reviewAssignments?.length || 0}`,
-    `quality-gate: ${finalSession.qualityGate?.passed ? 'passed' : 'failed'}`,
-    ...buildMergeSummaryLines(mergeResult),
-    `recovery: ${recovery.length}`,
-    `audit trail: ${finalSession.auditTrail?.length || 0}`,
-    `completed tasks: ${completed}`,
-    `failed tasks: ${failed}`,
-    `workspaces: ${Object.values(workspaces).map(item => `${item.mcpId}@${item.path}`).join(', ')}`,
-  ].join('\n')
+  return renderExecutionPlan(buildDashboardView(planned))
 }

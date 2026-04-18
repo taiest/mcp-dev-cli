@@ -1,7 +1,8 @@
 import type { McpRoleType, OrchestratedTask, TaskGraph } from '../../types.js'
 import { detectTechStack } from '../../utils/platform.js'
+import { isReadOnlyValidationText } from '../worker/validation-task.js'
 
-type RequirementKind = 'analysis' | 'docs' | 'bugfix' | 'refactor' | 'feature'
+type RequirementKind = 'analysis' | 'docs' | 'validation' | 'bugfix' | 'refactor' | 'feature'
 
 interface TaskSeed {
   roleType: McpRoleType
@@ -50,6 +51,9 @@ export class TaskGraphBuilder {
     }
     if (this.matches(requirement, ['readme', 'docs', 'documentation', 'changelog', '文档'])) {
       return 'docs'
+    }
+    if (isReadOnlyValidationText(requirement)) {
+      return 'validation'
     }
     if (this.matches(requirement, ['fix', 'bug', 'issue', 'error', 'regression', '修复', '问题', '报错'])) {
       return 'bugfix'
@@ -112,8 +116,19 @@ export class TaskGraphBuilder {
             files: ['README.md', 'docs/**'],
           },
         ]
-      case 'bugfix':
-        return this.withOptionalReviewer([
+      case 'validation':
+        return [
+          {
+            roleType: includeRole('tester') ? 'tester' : preferredRoles[0] || 'tester',
+            title: 'Run smoke/read-only validation',
+            description: `Run read-only validation for: ${requirement}. Do not modify repository code. Verify current behavior within ${stackText}.`,
+            dependencies: [],
+            reviewRequired: false,
+            files: [],
+          },
+        ]
+      case 'bugfix': {
+        const seeds: TaskSeed[] = [
           {
             roleType: includeRole('developer') ? 'developer' : preferredRoles[0] || 'developer',
             title: 'Fix implementation issue',
@@ -121,19 +136,32 @@ export class TaskGraphBuilder {
             dependencies: [],
             reviewRequired: true,
             files: [],
-            contracts: this.isContractSensitive(requirement) ? ['contract-bugfix'] : [],
           },
-          {
-            roleType: includeRole('tester') ? 'tester' : 'developer',
-            title: 'Validate bugfix regression coverage',
-            description: `Validate the fix for: ${requirement} with focused regression checks.`,
-            dependencies: ['task-1'],
+        ]
+
+        if (includeRole('tester')) {
+          seeds.push({
+            roleType: 'tester',
+            title: 'Prepare regression validation',
+            description: `Define focused regression checks and validation targets for: ${requirement}.`,
+            dependencies: [],
             reviewRequired: false,
             files: [],
-          },
-        ], includeRole('reviewer'))
-      case 'refactor':
-        return this.withOptionalReviewer([
+          })
+          seeds.push({
+            roleType: 'tester',
+            title: 'Validate bugfix regression coverage',
+            description: `Run the focused regression validation for: ${requirement}.`,
+            dependencies: ['task-1', 'task-2'],
+            reviewRequired: false,
+            files: [],
+          })
+        }
+
+        return this.withOptionalReviewer(seeds, includeRole('reviewer'))
+      }
+      case 'refactor': {
+        const seeds: TaskSeed[] = [
           {
             roleType: includeRole('architect') ? 'architect' : 'analyst',
             title: 'Define refactor boundaries',
@@ -142,27 +170,45 @@ export class TaskGraphBuilder {
             reviewRequired: false,
             files: [],
           },
-          {
-            roleType: includeRole('developer') ? 'developer' : preferredRoles[0] || 'developer',
-            title: 'Implement refactor changes',
-            description: `Implement the refactor for: ${requirement} without changing the tech stack (${stackText}).`,
-            dependencies: ['task-1'],
-            reviewRequired: true,
-            files: [],
-            contracts: this.isContractSensitive(requirement) ? ['contract-refactor'] : [],
-          },
-          {
-            roleType: includeRole('tester') ? 'tester' : 'developer',
-            title: 'Verify refactor stability',
-            description: `Run focused verification for the refactor: ${requirement}.`,
-            dependencies: ['task-2'],
+        ]
+
+        if (includeRole('tester')) {
+          seeds.push({
+            roleType: 'tester',
+            title: 'Design refactor verification checks',
+            description: `Design focused verification checks for the refactor: ${requirement}.`,
+            dependencies: [],
             reviewRequired: false,
             files: [],
-          },
-        ], includeRole('reviewer'))
+          })
+        }
+
+        seeds.push({
+          roleType: includeRole('developer') ? 'developer' : preferredRoles[0] || 'developer',
+          title: 'Implement refactor changes',
+          description: `Implement the refactor for: ${requirement} without changing the tech stack (${stackText}).`,
+          dependencies: ['task-1'],
+          reviewRequired: true,
+          files: [],
+        })
+
+        if (includeRole('tester')) {
+          seeds.push({
+            roleType: 'tester',
+            title: 'Verify refactor stability',
+            description: `Run focused verification for the refactor: ${requirement}.`,
+            dependencies: ['task-3', 'task-2'],
+            reviewRequired: false,
+            files: [],
+          })
+        }
+
+        return this.withOptionalReviewer(seeds, includeRole('reviewer'))
+      }
       case 'feature':
       default: {
         const seeds: TaskSeed[] = []
+
         if ((this.isAmbiguous(requirement) || this.isContractSensitive(requirement)) && includeRole('analyst')) {
           seeds.push({
             roleType: 'analyst',
@@ -173,33 +219,51 @@ export class TaskGraphBuilder {
             files: [],
           })
         }
+
         if ((this.isContractSensitive(requirement) || this.isArchitectureHeavy(requirement)) && includeRole('architect')) {
           seeds.push({
             roleType: 'architect',
             title: 'Define architecture and contracts',
             description: `Define the architecture and interface expectations for: ${requirement} within ${stackText}.`,
-            dependencies: seeds.length > 0 ? [`task-${seeds.length}`] : [],
+            dependencies: [],
             reviewRequired: false,
             files: [],
           })
         }
+
+        if (includeRole('tester')) {
+          seeds.push({
+            roleType: 'tester',
+            title: 'Prepare feature acceptance checks',
+            description: `Prepare the validation and acceptance checks for: ${requirement}.`,
+            dependencies: [],
+            reviewRequired: false,
+            files: [],
+          })
+        }
+
+        const implementationDependencies = seeds.map((_, index) => `task-${index + 1}`)
         seeds.push({
           roleType: includeRole('developer') ? 'developer' : preferredRoles[0] || 'developer',
           title: 'Implement feature changes',
           description: `Implement the requested feature for: ${requirement}. Keep to ${stackText}.`,
-          dependencies: seeds.length > 0 ? [`task-${seeds.length}`] : [],
+          dependencies: implementationDependencies,
           reviewRequired: true,
           files: [],
-          contracts: this.isContractSensitive(requirement) ? ['contract-feature'] : [],
         })
-        seeds.push({
-          roleType: includeRole('tester') ? 'tester' : 'developer',
-          title: 'Validate feature behavior',
-          description: `Validate the implemented behavior for: ${requirement}.`,
-          dependencies: [`task-${seeds.length}`],
-          reviewRequired: false,
-          files: [],
-        })
+
+        if (includeRole('tester')) {
+          const prepTaskId = seeds.findIndex(seed => seed.title === 'Prepare feature acceptance checks') + 1
+          seeds.push({
+            roleType: 'tester',
+            title: 'Validate feature behavior',
+            description: `Validate the implemented behavior for: ${requirement}.`,
+            dependencies: prepTaskId > 0 ? [`task-${implementationDependencies.length + 1}`, `task-${prepTaskId}`] : [`task-${implementationDependencies.length + 1}`],
+            reviewRequired: false,
+            files: [],
+          })
+        }
+
         return this.withOptionalReviewer(seeds, includeRole('reviewer'))
       }
     }
@@ -207,21 +271,20 @@ export class TaskGraphBuilder {
 
   private withOptionalReviewer(seeds: TaskSeed[], includeReviewer: boolean): TaskSeed[] {
     if (!includeReviewer || !seeds.some(seed => seed.reviewRequired)) return seeds
+    const reviewTargets = seeds
+      .map((seed, index) => seed.reviewRequired ? `task-${index + 1}` : null)
+      .filter((taskId): taskId is string => Boolean(taskId))
     return [
       ...seeds,
       {
         roleType: 'reviewer',
         title: 'Review implementation results',
         description: 'Review all review-required implementation outputs and approve or request changes.',
-        dependencies: [this.lastTaskId(seeds.length)],
+        dependencies: reviewTargets,
         reviewRequired: false,
         files: [],
       },
     ]
-  }
-
-  private lastTaskId(length: number): string {
-    return `task-${length}`
   }
 
   private matches(text: string, keywords: string[]): boolean {

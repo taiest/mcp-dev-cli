@@ -21,7 +21,7 @@ export class FailureRecovery {
       message: reason,
       timestamp: timestamp(),
       action: 'diagnose',
-      suggestion: this.buildSessionSuggestion(failedTasks.length, blockedTasks.length, reason),
+      suggestion: this.buildSessionSuggestion(session, failedTasks.length, blockedTasks.length, reason),
     })
 
     for (const task of failedTasks) {
@@ -122,12 +122,18 @@ export class FailureRecovery {
     return steps
   }
 
-  private buildSessionSuggestion(failedCount: number, blockedCount: number, reason: string): string {
+  private buildSessionSuggestion(session: ExecutionSession, failedCount: number, blockedCount: number, reason: string): string {
     if (reason.includes('git-lock')) {
       return '本次失败集中在 Git 锁；需先确认无其他 Git 进程，再清锁并 resume。'
     }
     if (reason.includes('merge-in-progress') || reason.includes('rebase-in-progress') || reason.includes('cherry-pick-in-progress')) {
       return '检测到 Git 中间态；优先执行 rollback-single-task 或 rollback-merge-step，再继续。'
+    }
+    if (session.governance?.status === 'review_rejected' || reason.includes('review rejected')) {
+      return '当前被 reviewer 明确拒绝；先修复被拒绝的任务实现，再重新触发 review。'
+    }
+    if (session.governance?.status === 'waiting_approval' || reason.includes('review approvals not complete')) {
+      return '当前仍在等待 review approval；先完成 reviewer 审批，再继续 merge。'
     }
     if (reason.includes('merge')) {
       return '本次失败集中在 merge 阶段；优先解决冲突分支，再 resume。'

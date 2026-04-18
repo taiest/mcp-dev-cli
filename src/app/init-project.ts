@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { AGENTS_DIR, PARALLEL_DIR, PARALLEL_WORKSPACES_DIR } from '../types.js'
 import { detectTechStack } from '../utils/platform.js'
 import { checkClaudeInstalled } from '../utils/claude-cli.js'
+import { normalizeProjectMcpConfig } from '../utils/mcp-config.js'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 
@@ -44,12 +45,15 @@ export async function initProjectApp(projectRoot: string): Promise<string> {
     writeFileSync(mcpConfigPath, template.replace('{{projectRoot}}', projectRoot), 'utf-8')
   }
 
+  const mcpConfigResult = normalizeProjectMcpConfig(projectRoot)
+
   return [
     '✅ parallel platform initialized',
     `project: ${projectRoot}`,
     `claude: ${hasClaude ? 'available' : 'missing'}`,
     `stack: ${stack.frameworks.join(', ') || 'unknown'}`,
     `parallel dir: ${PARALLEL_DIR}`,
+    `mcp config: ${mcpConfigResult.updated ? 'normalized' : 'already-ready'}`,
     'startup flow: ready',
   ].join('\n')
 }
