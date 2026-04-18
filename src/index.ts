@@ -11,14 +11,19 @@ import { getDashboard } from './app/get-dashboard.js'
 import { exportParallelReport } from './app/export-report.js'
 import { switchModel } from './app/switch-model.js'
 import { addContract, listContracts } from './app/manage-contracts.js'
+import { patchSession } from './app/patch-session.js'
+import { manageContext } from './app/manage-context.js'
 import { installAndConnect } from './app/install-and-connect.js'
 import { PreflightScanner } from './core/preflight/preflight-scanner.js'
 import { SessionRuntime } from './core/runtime/session-runtime.js'
 import { renderPreflight, renderStartupFlow } from './core/terminal/renderers.js'
-import { findProjectRoot } from './utils/platform.js'
+import { findInstallProjectRoot, findProjectRoot, resolveInstallProjectRoot } from './utils/platform.js'
 
 async function runInstallCommand() {
-  const root = findProjectRoot()
+  const explicitProjectPath = process.argv[3]
+  const root = explicitProjectPath
+    ? resolveInstallProjectRoot(explicitProjectPath)
+    : findInstallProjectRoot()
   const result = await installAndConnect(root)
   process.stdout.write(`${result}\n`)
 }
@@ -26,12 +31,12 @@ async function runInstallCommand() {
 async function startMcpServer() {
   const server = new McpServer({
     name: 'mcp-dev-cli',
-    version: '0.5.1',
+    version: '0.7.0',
   })
 
   server.tool(
     'parallel_init',
-    '在 startup 判断需要初始化时使用，创建当前仓库的并行协作目录、角色模板与基础结构。',
+    '初始化项目的并行开发环境，创建必要的目录结构和配置文件。',
     {
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
     },
@@ -44,7 +49,7 @@ async function startMcpServer() {
 
   server.tool(
     'parallel_startup',
-    '通过 /mcp 连接工具后优先使用：显示当前连接状态、项目是否可开始开发，以及下一步该 init、start、approve 还是 resume。',
+    '查看项目状态总览：环境检测、项目完整度、需求分析，以及推荐的下一步操作。',
     {
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
     },
@@ -56,8 +61,39 @@ async function startMcpServer() {
   )
 
   server.tool(
+    'parallel_requirement',
+    '录入本轮项目需求，系统会自动分析需求类型、影响范围和推荐的团队配置。需求录入后必须调用 parallel_start 生成执行计划，不要自行开发。',
+    {
+      requirement: z.string().min(1).describe('本轮项目需求描述'),
+      projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+    },
+    async ({ requirement, projectRoot }) => {
+      const root = projectRoot || findProjectRoot()
+      const runtime = new SessionRuntime(root)
+      const draft = runtime.saveRequirementDraft(requirement.trim())
+      const startup = await runtime.buildStartupFlow()
+      return {
+        content: [{
+          type: 'text' as const,
+          text: [
+            '✅ requirement captured',
+            `project: ${root}`,
+            `captured at: ${draft.capturedAt}`,
+            `requirement: ${draft.requirement}`,
+            '',
+            '⚠️ IMPORTANT: Do NOT start coding or implementing this requirement directly.',
+            '⚠️ You MUST call parallel_start to split tasks, assign AI roles, and generate an execution plan.',
+            '',
+            renderStartupFlow(startup),
+          ].join('\n'),
+        }],
+      }
+    }
+  )
+
+  server.tool(
     'parallel_preflight',
-    '在启动前使用，检查 Git、Claude、Node、网络和构建链路是否阻塞并行 session。',
+    '检查开发环境是否就绪：Git、Node、构建工具、项目完整度，并给出修复建议。',
     {
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
     },
@@ -67,16 +103,17 @@ async function startMcpServer() {
       const result = {
         config: scanner.scanConfig(root),
         preflight: await scanner.scan(root),
+        completeness: scanner.scanCompleteness(root),
       }
-      return { content: [{ type: 'text' as const, text: renderPreflight(result.config, result.preflight) }] }
+      return { content: [{ type: 'text' as const, text: renderPreflight(result.config, result.preflight, result.completeness) }] }
     }
   )
 
   server.tool(
     'parallel_start',
-    '在输入需求后使用：先生成需求拆解、任务分配与执行计划，等待用户审批，不会立即执行。',
+    '根据需求自动拆解任务、分配多个 AI 角色并生成执行计划。注意：此工具只生成计划，不会创建角色或开始执行。计划生成后必须调用 parallel_approve 才能启动开发。',
     {
-      requirement: z.string().describe('开发需求描述'),
+      requirement: z.string().optional().describe('开发需求描述；留空时优先使用 parallel_requirement 已记录的需求'),
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
       mcpCount: z.number().int().min(1).max(12).optional().describe('MCP 节点数量，默认 6'),
     },
@@ -89,33 +126,33 @@ async function startMcpServer() {
 
   server.tool(
     'parallel_approve',
-    '在执行计划确认后使用：创建角色与工作区，进入前台主控执行，并返回实时控制摘要与最终结果。',
+    '确认执行计划后启动：创建各角色工作区，开始多角色并行开发，实时输出进度。',
     {
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
     },
     async ({ projectRoot }) => {
       const root = projectRoot || findProjectRoot()
-      const result = await approveSession(root)
+      const result = await approveSession(root, server.server)
       return { content: [{ type: 'text' as const, text: result }] }
     }
   )
 
   server.tool(
     'parallel_resume',
-    '在存在中断 session 时使用，恢复当前进度、继续前台执行，并告诉你还剩什么工作。',
+    '恢复中断的开发任务，从上次进度继续执行。',
     {
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
     },
     async ({ projectRoot }) => {
       const root = projectRoot || findProjectRoot()
-      const result = await resumeSession(root)
+      const result = await resumeSession(root, server.server)
       return { content: [{ type: 'text' as const, text: result }] }
     }
   )
 
   server.tool(
     'parallel_dashboard',
-    '查看多 MCP 主控界面：显示当前分配、角色、进度、阻塞、审批状态和建议下一步。',
+    '查看当前开发进度：各角色状态、任务完成情况、阻塞项和下一步建议。',
     {
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
     },
@@ -128,7 +165,7 @@ async function startMcpServer() {
 
   server.tool(
     'parallel_report',
-    '在需要回顾本轮结果时使用，输出当前 session 的执行总结、关键指标和后续建议。',
+    '查看本轮开发总结：完成情况、关键指标和后续建议。',
     {
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
     },
@@ -141,7 +178,7 @@ async function startMcpServer() {
 
   server.tool(
     'parallel_model_switch',
-    '在运行中需要切换指定 MCP 节点模型时使用，并尽量保持当前 session 上下文连续。',
+    '切换指定角色使用的 AI 模型，保持当前工作进度不丢失。',
     {
       mcpId: z.string().describe('MCP 编号，如 MCP-03'),
       model: z.string().describe('目标模型名称'),
@@ -156,7 +193,7 @@ async function startMcpServer() {
 
   server.tool(
     'parallel_contracts',
-    '在需要查看或补充 session 契约时使用，管理并行执行中的接口/交付契约。',
+    '查看或添加角色间的接口契约，确保多角色协作时接口一致。',
     {
       action: z.enum(['list', 'add']).describe('契约操作'),
       name: z.string().optional().describe('契约名称，action=add 时必填'),
@@ -172,14 +209,58 @@ async function startMcpServer() {
     }
   )
 
+  server.tool(
+    'parallel_patch',
+    '在已完成的 session 上追加修改或修复任务。自动加载目标 MCP 的上下文缓存，派给原负责人继续执行。',
+    {
+      requirement: z.string().min(1).describe('修改/修复需求描述'),
+      targetMcpId: z.string().optional().describe('指定派给哪个 MCP，留空则自动匹配原负责人'),
+      projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+    },
+    async ({ requirement, targetMcpId, projectRoot }) => {
+      const root = projectRoot || findProjectRoot()
+      const result = await patchSession(root, requirement, targetMcpId, server.server)
+      return { content: [{ type: 'text' as const, text: result }] }
+    }
+  )
+
+  server.tool(
+    'parallel_context',
+    '查看、检索或恢复上下文缓存。每个 MCP 的每个任务完成后都会自动保存上下文快照，带时间戳，不受重启影响。',
+    {
+      action: z.enum(['list', 'show', 'restore']).describe('操作类型：list 列出所有 / show 查看详情 / restore 按时间点恢复'),
+      mcpId: z.string().optional().describe('MCP 编号，action=show 时必填'),
+      taskId: z.string().optional().describe('任务编号，action=show 时必填'),
+      timestamp: z.string().optional().describe('时间点，action=restore 时必填，格式如 "2025-01-15 14:32"'),
+      projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+    },
+    async ({ action, mcpId, taskId, timestamp, projectRoot }) => {
+      const root = projectRoot || findProjectRoot()
+      const result = manageContext(root, action, mcpId, taskId, timestamp)
+      return { content: [{ type: 'text' as const, text: result }] }
+    }
+  )
+
   const transport = new StdioServerTransport()
   await server.connect(transport)
+}
+
+async function runUninstallCommand() {
+  const explicitProjectPath = process.argv[3]
+  const root = explicitProjectPath
+    ? resolveInstallProjectRoot(explicitProjectPath)
+    : findInstallProjectRoot()
+  const { uninstallProject } = await import('./app/uninstall.js')
+  const result = await uninstallProject(root)
+  process.stdout.write(`${result}\n`)
 }
 
 const command = process.argv[2]
 
 if (command === 'install') {
   await runInstallCommand()
+} else if (command === 'uninstall') {
+  await runUninstallCommand()
 } else {
   await startMcpServer()
 }

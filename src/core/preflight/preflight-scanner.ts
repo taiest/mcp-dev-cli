@@ -1,4 +1,13 @@
-import type { PreflightCheckResult, PreflightReport, ProjectConfigCheck, ProjectConfigReport } from '../../types.js'
+import { existsSync } from 'node:fs'
+import { join } from 'node:path'
+import type {
+  PreflightCheckResult,
+  PreflightReport,
+  ProjectCompletenessArea,
+  ProjectCompletenessReport,
+  ProjectConfigCheck,
+  ProjectConfigReport,
+} from '../../types.js'
 import { runGitCheck } from './checks/git-check.js'
 import { runClaudeCheck } from './checks/claude-check.js'
 import { runNodeCheck } from './checks/node-check.js'
@@ -73,6 +82,20 @@ function buildMcpConfigCheck(projectRoot: string): ProjectConfigCheck {
   }
 }
 
+function statusFromFiles(paths: string[]): 'present' | 'partial' | 'missing' {
+  const count = paths.filter(path => existsSync(path)).length
+  if (count === 0) return 'missing'
+  if (count === paths.length) return 'present'
+  return 'partial'
+}
+
+function messageForStatus(title: string, status: 'present' | 'partial' | 'missing', paths: string[]): string {
+  const pathLabel = paths.map(path => path.split('/').slice(-2).join('/')).join(', ')
+  if (status === 'present') return `${title} 已具备 (${pathLabel})`
+  if (status === 'partial') return `${title} 仅部分具备 (${pathLabel})`
+  return `${title} 缺失 (${pathLabel})`
+}
+
 export class PreflightScanner {
   async scan(projectRoot: string): Promise<PreflightReport> {
     const checks = [
@@ -130,6 +153,53 @@ export class PreflightScanner {
     return {
       passed: checks.every(check => check.status !== 'failed'),
       checks,
+    }
+  }
+
+  scanCompleteness(projectRoot: string): ProjectCompletenessReport {
+    const areas: ProjectCompletenessArea[] = [
+      this.buildArea('build', 'Build chain', [join(projectRoot, 'package.json'), join(projectRoot, 'go.mod'), join(projectRoot, 'pyproject.toml')]),
+      this.buildArea('tests', 'Validation/tests', [join(projectRoot, 'tests'), join(projectRoot, '__tests__'), join(projectRoot, 'vitest.config.ts'), join(projectRoot, 'jest.config.js')]),
+      this.buildArea('source', 'Source modules', [join(projectRoot, 'src'), join(projectRoot, 'server'), join(projectRoot, 'app')]),
+      this.buildArea('docs', 'Project docs', [join(projectRoot, 'README.md'), join(projectRoot, 'docs')]),
+      this.buildArea('config', 'Project config', [join(projectRoot, '.env.example'), join(projectRoot, 'tsconfig.json'), join(projectRoot, '.mcp.json')]),
+    ]
+
+    const hardBlockers = areas
+      .filter(area => area.key === 'source' && area.status === 'missing')
+      .map(area => area.message)
+    const softGaps = areas
+      .filter(area => area.status === 'missing' && area.key !== 'source')
+      .map(area => area.message)
+    const suggestions = [
+      ...areas.filter(area => area.status === 'partial').map(area => `补齐 ${area.title.toLowerCase()}，降低主控启动后的不确定性。`),
+      ...(softGaps.length === 0 ? ['项目基础结构完整，可直接进入需求分析与 planning。'] : []),
+    ]
+
+    const status = hardBlockers.length > 0 ? 'blocked' : softGaps.length > 0 ? 'warning' : 'ready'
+    const summary = status === 'blocked'
+      ? '项目基础结构存在硬阻塞，暂不适合直接进入多角色执行。'
+      : status === 'warning'
+        ? '项目可启动，但仍有缺失项会增加主控分析和执行风险。'
+        : '项目结构较完整，可进入需求分析与多角色 planning。'
+
+    return {
+      status,
+      summary,
+      hardBlockers,
+      softGaps,
+      suggestions,
+      areas,
+    }
+  }
+
+  private buildArea(key: string, title: string, paths: string[]): ProjectCompletenessArea {
+    const status = statusFromFiles(paths)
+    return {
+      key,
+      title,
+      status,
+      message: messageForStatus(title, status, paths),
     }
   }
 }

@@ -3,17 +3,23 @@ import { buildDashboardView } from '../core/report/dashboard-view.js'
 import { renderDashboard } from '../core/terminal/renderers.js'
 
 export async function getDashboard(projectRoot: string): Promise<string> {
-  const session = new SessionRuntime(projectRoot).load()
+  const runtime = new SessionRuntime(projectRoot)
+  const session = runtime.load()
   if (!session) {
+    const startup = await runtime.buildStartupFlow()
     return [
       '📊 Parallel Dashboard',
       '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
       '当前没有 active parallel session。',
       '',
-      '建议下一步：',
-      '- 先确认你已通过 /mcp 连接该工具。',
-      '- 然后运行 parallel_startup，判断当前项目该 init、start 还是 resume。',
-      '- 如果项目已 ready，直接在对话框输入需求并调用 parallel_start。',
+      'What To Do Next',
+      ...[
+        startup.summary,
+        `development: ${startup.developmentStatus}`,
+        `completeness: ${startup.completeness.status}`,
+        `recommended tool: ${startup.recommendedAction}`,
+        `next: ${startup.nextActions.join(', ') || 'none'}`,
+      ].map(line => `  ${line}`),
     ].join('\n')
   }
   return renderDashboard(buildDashboardView(session))

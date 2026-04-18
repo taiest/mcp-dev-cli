@@ -6,6 +6,7 @@ import { createAgentFiles, summarizeAssignments, summarizeCreatedRoles } from '.
 import { runForegroundExecution } from './foreground-execution.js'
 import { renderExecutionPlan, renderSessionOutcome } from '../core/terminal/renderers.js'
 import type { ExecutionSession } from '../types.js'
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 
 function withPreparedExecution(
   runtime: SessionRuntime,
@@ -35,7 +36,7 @@ function withPreparedExecution(
   ])
 }
 
-export async function approveSession(projectRoot: string): Promise<string> {
+export async function approveSession(projectRoot: string, server?: Server): Promise<string> {
   const runtime = new SessionRuntime(projectRoot)
   const session = runtime.load()
   if (!session) {
@@ -100,6 +101,7 @@ export async function approveSession(projectRoot: string): Promise<string> {
     mergeAction: 'approve-merge-session',
     mergeSuccessMessage: 'merge completed after approval',
     mergeFailureFallback: 'merge failed after approval',
+    server,
   })
 
   return [

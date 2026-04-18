@@ -2,21 +2,32 @@ import type {
   ExecutionSummaryReport,
   ParallelProgressEvent,
   PreflightReport,
+  ProjectCompletenessReport,
   ProjectConfigReport,
   SessionPhase,
   StartupFlowState,
 } from '../../types.js'
 import type { DashboardView } from '../report/dashboard-view.js'
 import { isReadOnlyValidationText } from '../worker/validation-task.js'
+import Table from 'cli-table3'
+import { header as uiHeader, box, kvBlock, statusIcon, LINE, W } from './ui.js'
+
+const TABLE_CHARS = {
+  'top': '─', 'top-mid': '┬', 'top-left': '┌', 'top-right': '┐',
+  'bottom': '─', 'bottom-mid': '┴', 'bottom-left': '└', 'bottom-right': '┘',
+  'left': '│', 'left-mid': '├', 'mid': '─', 'mid-mid': '┼',
+  'right': '│', 'right-mid': '┤', 'middle': '│',
+}
+const TABLE_STYLE = { head: [] as string[], border: [] as string[] }
 
 function divider(char = '━', width = 52): string {
   return char.repeat(width)
 }
 
 function iconForState(status: string): string {
-  if (['passed', 'completed', 'ready_for_merge', 'merged', 'success', 'available', 'ready'].includes(status)) return '✅'
-  if (['warning', 'review_required', 'review_assigned', 'waiting_approval', 'running', 'reviewing', 'started', 'dispatching', 'merging', 'quality-gate'].includes(status)) return '⚠️'
-  if (['failed', 'review_rejected', 'blocked'].includes(status)) return '❌'
+  if (['passed', 'completed', 'ready_for_merge', 'merged', 'success', 'available', 'ready', 'present'].includes(status)) return '✅'
+  if (['warning', 'review_required', 'review_assigned', 'waiting_approval', 'running', 'reviewing', 'started', 'dispatching', 'merging', 'quality-gate', 'partial'].includes(status)) return '⚠️'
+  if (['failed', 'review_rejected', 'blocked', 'missing'].includes(status)) return '❌'
   if (['pending', 'idle', 'assigned'].includes(status)) return '⏳'
   return '•'
 }
@@ -63,7 +74,6 @@ function mergeStateText(success?: boolean, error?: string, validation = false): 
   if (validation) return success ? 'passed' : error ? 'blocked' : 'pending'
   return success ? 'passed' : error ? 'blocked' : 'pending'
 }
-
 
 function shortRole(roleType: string): string {
   return roleType === 'controller'
@@ -231,40 +241,133 @@ export function renderProgressLog(events: ParallelProgressEvent[], limit = 14): 
 }
 
 export function renderStartupFlow(flow: StartupFlowState): string {
-  const lines = [
-    '🚀 Parallel Startup',
-    divider(),
-    ...linesFromPairs([
-      ['project', flow.projectRoot],
-      ['connection', flow.connectionStatus],
-      ['development', flow.developmentStatus],
-      ['recommended', flow.recommendedEntry],
-      ['tool', flow.recommendedAction],
-      ['git', flow.discovery.hasGit ? 'ready' : 'missing'],
-      ['initialized', flow.discovery.initialized ? 'yes' : 'no'],
-      ['stack', joinList(flow.discovery.stack)],
-      ['recent sessions', flow.recentSessions.length],
-      ['templates', flow.templates.length],
-    ]),
-    ...renderSection('What To Do Next', renderStartupRecommendations(flow)),
-    ...renderSection('Requirement Input', flow.canAcceptRequirement
-      ? [flow.requirementPrompt || '已连接并可输入需求。', 'next: 在对话框输入需求并回车，再调用 parallel_start。']
+  const requirementLines = flow.requirementDraft
+    ? [
+        `captured: ${flow.requirementDraft.capturedAt}`,
+        `requirement: ${flow.requirementDraft.requirement}`,
+        `⛔ Do NOT implement this requirement yourself. Call parallel_start now.`,
+      ]
+    : flow.canAcceptRequirement
+      ? [flow.requirementPrompt || '已连接并可输入需求。', 'next: run parallel_requirement first, then run parallel_start.']
       : flow.developmentStatus === 'resumable'
         ? ['当前优先恢复已有 session，无需重新输入需求。', 'next: 运行 parallel_resume 或先看 parallel_dashboard。']
         : flow.developmentStatus === 'approval_required'
           ? ['当前已有待审批执行计划。', 'next: 运行 parallel_approve 进入主控执行，或先看 parallel_dashboard。']
-          : ['当前还不能直接开始需求开发。', 'next: 先按 recommended tool 修复阻塞项。']),
-    ...renderSection('Entries', [
-      `${iconForState(flow.entries.approve.available ? 'ready' : 'warning')} approve: ${flow.entries.approve.available ? 'available' : flow.entries.approve.reason || 'unavailable'}`,
-      `${iconForState(flow.entries.newSession.available ? 'ready' : 'warning')} new session: ${flow.entries.newSession.available ? 'available' : flow.entries.newSession.reason || 'unavailable'}`,
-      `${iconForState(flow.entries.resume.available ? 'ready' : 'warning')} resume: ${flow.entries.resume.available ? 'available' : flow.entries.resume.reason || 'unavailable'}`,
-      `${iconForState(flow.entries.template.available ? 'ready' : 'warning')} template: ${flow.entries.template.available ? 'available' : flow.entries.template.reason || 'unavailable'}`,
-    ]),
-    ...renderSection('Recent Sessions', renderRecentSessions(flow)),
-    ...renderSection('Templates', renderStartupTemplates(flow)),
-    ...renderSection('Startup Steps', flow.steps.map(step => `${iconForState(step.status)} ${step.title} [${step.status}] ${step.message}${step.nextStep ? ` | next: ${step.nextStep}` : ''}`)),
+          : ['当前还不能直接开始需求开发。', 'next: 先按 recommended tool 修复阻塞项。']
+
+  // Status overview table
+  const statusTable = new Table({
+    chars: TABLE_CHARS,
+    head: ['Item', 'Status', 'Detail'],
+    colWidths: [18, 12, 56],
+    style: TABLE_STYLE,
+  })
+  statusTable.push(
+    ['project', flow.discovery.initialized ? '✅ ready' : '⚠️ init', flow.projectRoot.slice(-50)],
+    ['connection', '✅ ok', flow.connectionStatus],
+    ['development', statusIcon(flow.developmentStatus) + ' ' + flow.developmentStatus, flow.recommendedAction],
+    ['git', flow.discovery.hasGit ? '✅ ready' : '❌ miss', flow.discovery.hasGit ? 'repository detected' : 'no git repository'],
+    ['stack', flow.discovery.stack.length > 0 ? '✅ ok' : '⚠️ none', joinList(flow.discovery.stack).slice(0, 50)],
+    ['completeness', statusIcon(flow.completeness.status) + ' ' + flow.completeness.status, flow.completeness.summary.slice(0, 50)],
+    ['requirement', flow.requirementDraft ? '✅ captured' : '⏳ missing', flow.requirementDraft ? flow.requirementDraft.requirement.slice(0, 50) : 'awaiting input'],
+  )
+
+  // Entries table
+  const entriesTable = new Table({
+    chars: TABLE_CHARS,
+    head: ['Entry', 'Available', 'Note'],
+    colWidths: [18, 12, 56],
+    style: TABLE_STYLE,
+  })
+  const entryRows: Array<[string, { available: boolean; reason?: string }]> = [
+    ['parallel_approve', flow.entries.approve],
+    ['parallel_start', flow.entries.newSession],
+    ['parallel_resume', flow.entries.resume],
+    ['template', flow.entries.template],
   ]
-  return lines.join('\n')
+  for (const [name, entry] of entryRows) {
+    entriesTable.push([name, entry.available ? '✅ yes' : '⛔ no', entry.available ? 'ready' : (entry.reason || 'unavailable').slice(0, 50)])
+  }
+
+  // Completeness areas table
+  const areasTable = new Table({
+    chars: TABLE_CHARS,
+    head: ['Area', 'Status', 'Detail'],
+    colWidths: [14, 12, 60],
+    style: TABLE_STYLE,
+  })
+  for (const area of flow.completeness.areas) {
+    areasTable.push([area.key, statusIcon(area.status) + ' ' + area.status, area.message.slice(0, 56)])
+  }
+
+  const sections = [
+    uiHeader('🚀', 'Parallel Controller — Startup'),
+    '',
+    statusTable.toString(),
+    '',
+  ]
+
+  // Requirement analysis (if available)
+  if (flow.requirementAnalysis) {
+    const a = flow.requirementAnalysis
+    sections.push(
+      box('📊 Requirement Analysis', [
+        `type: ${a.kind}    clarity: ${a.clarity}    risk: ${a.riskLevel}`,
+        `landing zones: ${joinList(a.likelyLandingZones).slice(0, 70)}`,
+        `recommended roles: ${joinList(a.recommendedRoles)}`,
+        ...(a.riskHints.length > 0 ? [`risk hints: ${a.riskHints.join('; ').slice(0, 70)}`] : []),
+      ]),
+      '',
+    )
+  }
+
+  sections.push(
+    box('📋 Project Completeness', [flow.completeness.summary]),
+    '',
+    areasTable.toString(),
+  )
+
+  if (flow.completeness.hardBlockers.length > 0) {
+    sections.push('', box('🚫 Hard Blockers', flow.completeness.hardBlockers))
+  }
+  if (flow.completeness.softGaps.length > 0) {
+    sections.push('', box('⚠️  Soft Gaps', flow.completeness.softGaps))
+  }
+
+  sections.push(
+    '',
+    box('🎯 Recommended Action', [
+      `tool: ${flow.recommendedAction}`,
+      `why: ${flow.recommendedReason}`,
+      `next: ${joinList(flow.nextActions)}`,
+    ]),
+    '',
+    entriesTable.toString(),
+    '',
+    box('📝 Requirement Input', requirementLines),
+  )
+
+  if (flow.recentSessions.length > 0) {
+    const sessTable = new Table({
+      chars: TABLE_CHARS,
+      head: ['Session', 'Requirement', 'Phase', 'Resumable'],
+      colWidths: [16, 38, 14, 12],
+      style: TABLE_STYLE,
+    })
+    for (const s of flow.recentSessions.slice(0, 4)) {
+      sessTable.push([s.sessionId.slice(0, 14), compactText(s.requirement, 34), s.phase, s.resumable ? '✅ yes' : '—'])
+    }
+    sections.push('', sessTable.toString())
+  }
+
+  sections.push(
+    '',
+    box('📌 Startup Steps', flow.steps.map(step =>
+      `${statusIcon(step.status)} ${step.title} [${step.status}]${step.nextStep ? ` → ${step.nextStep}` : ''}`
+    )),
+  )
+
+  return sections.join('\n')
 }
 
 export function renderStartupRecommendations(flow: StartupFlowState): string[] {
@@ -272,6 +375,13 @@ export function renderStartupRecommendations(flow: StartupFlowState): string[] {
     flow.summary,
     `connection: ${flow.connectionStatus}`,
     `development: ${flow.developmentStatus}`,
+    `completeness: ${flow.completeness.status}`,
+    `requirement: ${flow.requirementDraft ? 'captured' : 'missing'}`,
+    ...(flow.requirementAnalysis
+      ? [
+          `analysis: ${flow.requirementAnalysis.kind} | landing=${joinList(flow.requirementAnalysis.likelyLandingZones)} | risk=${flow.requirementAnalysis.riskLevel}`,
+        ]
+      : []),
     `recommended tool: ${flow.recommendedAction}`,
     `why: ${flow.recommendedReason}`,
     `next: ${joinList(flow.nextActions)}`,
@@ -288,26 +398,138 @@ function renderStartupTemplates(flow: StartupFlowState): string[] {
   return flow.templates.slice(0, 4).map(item => `${item.id} | ${item.title} | ${compactText(item.description, 44)}`)
 }
 
-function renderCompactSessionSummary(options: { headline: string; nextAction?: string; nextReason?: string; blockers?: string[] }): string[] {
+function renderStartupCompleteness(flow: StartupFlowState): string[] {
   return [
-    options.headline,
-    ...(options.nextAction ? [`next: ${options.nextAction}${options.nextReason ? ` | ${options.nextReason}` : ''}`] : []),
-    ...((options.blockers || []).length > 0 ? (options.blockers || []).map(item => `blocker: ${compactText(item, 72)}`) : []),
+    flow.completeness.summary,
+    `status: ${flow.completeness.status}`,
+    `hard blockers: ${joinList(flow.completeness.hardBlockers)}`,
+    `soft gaps: ${joinList(flow.completeness.softGaps)}`,
+    `suggestions: ${joinList(flow.completeness.suggestions)}`,
+    ...flow.completeness.areas.map(area => `${area.key} | ${area.status} | ${area.message}`),
   ]
 }
 
-export function renderPreflight(config: ProjectConfigReport, preflight: PreflightReport): string {
-  const lines = [
-    '🩺 Parallel Preflight',
-    divider(),
-    ...linesFromPairs([
-      ['config', config.passed ? 'passed' : 'attention'],
-      ['preflight', preflight.passed ? 'passed' : 'attention'],
-    ]),
-    ...renderChecks('Config Checks', config.checks),
-    ...renderChecks('Runtime Checks', preflight.checks),
+function renderStartupRequirementAnalysis(flow: StartupFlowState): string[] {
+  if (!flow.requirementDraft) return ['⏳ no requirement captured']
+  if (!flow.requirementAnalysis) return ['⚠️ requirement captured but analysis is unavailable']
+  return [
+    `kind: ${flow.requirementAnalysis.kind}`,
+    `landing zones: ${joinList(flow.requirementAnalysis.likelyLandingZones)}`,
+    `recommended roles: ${joinList(flow.requirementAnalysis.recommendedRoles)}`,
+    `clarity: ${flow.requirementAnalysis.clarity}`,
+    `clarity hints: ${joinList(flow.requirementAnalysis.clarityHints)}`,
+    `risk: ${flow.requirementAnalysis.riskLevel}`,
+    `risk hints: ${joinList(flow.requirementAnalysis.riskHints)}`,
   ]
-  return lines.join('\n')
+}
+
+function renderPlanningAnalysis(view: DashboardView): string[] {
+  const analysis = view.planning
+  return [
+    `kind: ${analysis.kind}`,
+    `landing zones: ${joinList(analysis.likelyLandingZones)}`,
+    `recommended roles: ${joinList(analysis.recommendedRoles)}`,
+    `clarity: ${analysis.clarity}`,
+    `clarity hints: ${joinList(analysis.clarityHints)}`,
+    `risk: ${analysis.riskLevel}`,
+    `risk hints: ${joinList(analysis.riskHints)}`,
+  ]
+}
+
+function renderReassignmentSummary(view: DashboardView): string[] {
+  if (view.reassignmentHistory.length === 0) return ['✅ none']
+  return view.reassignmentHistory.slice(-6).map(item => `${item.taskId} | ${item.fromMcpId} -> ${item.toMcpId} | ${compactText(item.reason, 52)}`)
+}
+
+function renderPreflightCompleteness(completeness: ProjectCompletenessReport): string[] {
+  return [
+    completeness.summary,
+    `status: ${completeness.status}`,
+    `hard blockers: ${joinList(completeness.hardBlockers)}`,
+    `soft gaps: ${joinList(completeness.softGaps)}`,
+    `suggestions: ${joinList(completeness.suggestions)}`,
+    ...completeness.areas.map(area => `${area.key} | ${area.status} | ${area.message}`),
+  ]
+}
+
+function renderPreflightRecommendations(
+  config: ProjectConfigReport,
+  preflight: PreflightReport,
+  completeness: ProjectCompletenessReport
+): string[] {
+  const attention = !config.passed || !preflight.passed || completeness.status === 'blocked'
+  const canStart = config.passed && preflight.passed && completeness.status !== 'blocked'
+  const next = attention
+    ? 'fix failed checks / hard blockers, then rerun parallel_preflight'
+    : completeness.status === 'warning'
+      ? 'project can proceed, but fill soft gaps before broad multi-role dispatch'
+      : 'run parallel_requirement or parallel_startup to continue controller planning'
+
+  return [
+    attention
+      ? '当前仍有阻塞项，建议先补齐环境、配置或关键模块。'
+      : canStart
+        ? '当前 preflight 与完整度检查已达到可继续状态。'
+        : '当前建议先处理提示项后再继续。',
+    `config: ${config.passed ? 'passed' : 'attention'}`,
+    `runtime: ${preflight.passed ? 'passed' : 'attention'}`,
+    `completeness: ${completeness.status}`,
+    `next: ${next}`,
+  ]
+}
+
+export function renderPreflight(config: ProjectConfigReport, preflight: PreflightReport, completeness: ProjectCompletenessReport): string {
+  const checksTable = new Table({
+    chars: TABLE_CHARS,
+    head: ['Check', 'Status', 'Detail'],
+    colWidths: [20, 12, 54],
+    style: TABLE_STYLE,
+  })
+  for (const check of [...config.checks, ...preflight.checks]) {
+    checksTable.push([check.name, `${statusIcon(check.status)} ${check.status}`, (check.message || '').slice(0, 50)])
+  }
+
+  const areasTable = new Table({
+    chars: TABLE_CHARS,
+    head: ['Area', 'Status', 'Detail'],
+    colWidths: [14, 12, 60],
+    style: TABLE_STYLE,
+  })
+  for (const area of completeness.areas) {
+    areasTable.push([area.key, `${statusIcon(area.status)} ${area.status}`, area.message.slice(0, 56)])
+  }
+
+  const sections = [
+    uiHeader('🩺', 'Parallel Preflight'),
+    '',
+    checksTable.toString(),
+    '',
+    box('📋 Project Completeness', [completeness.summary]),
+    '',
+    areasTable.toString(),
+  ]
+
+  if (completeness.hardBlockers.length > 0) {
+    sections.push('', box('🚫 Hard Blockers', completeness.hardBlockers))
+  }
+  if (completeness.softGaps.length > 0) {
+    sections.push('', box('⚠️  Soft Gaps', completeness.softGaps))
+  }
+  if (completeness.suggestions.length > 0) {
+    sections.push('', box('💡 Suggestions', completeness.suggestions))
+  }
+
+  const canStart = config.passed && preflight.passed && completeness.status !== 'blocked'
+  sections.push(
+    '',
+    box('🎯 Recommendation', [
+      canStart ? '✅ 环境就绪，可以继续主控流程。' : '⚠️ 存在阻塞项，建议先修复。',
+      `config: ${config.passed ? 'passed' : 'attention'}  runtime: ${preflight.passed ? 'passed' : 'attention'}  completeness: ${completeness.status}`,
+      `next: ${canStart ? 'parallel_requirement or parallel_startup' : 'fix blockers, then rerun parallel_preflight'}`,
+    ]),
+  )
+
+  return sections.join('\n')
 }
 
 function renderCompactMergeBlock(input: {
@@ -355,43 +577,92 @@ function renderCompactMcpNodeBlock(view: DashboardView): string[] {
 
 export function renderDashboard(view: DashboardView): string {
   const label = mergeLabel(view)
-  const lines = [
-    '📊 Parallel Dashboard',
-    divider(),
-    ...renderHeaderSummary([
-      ['session', view.sessionId],
-      ['phase', labelForPhase(view.phase)],
-      ['controller', view.controller],
-      ['governance', view.governance.status],
-      ['running', view.taskCounts.running],
-      ['completed', view.taskCounts.completed],
-      ['failed', view.taskCounts.failed],
-      ['blocked', view.taskCounts.blocked],
-      ['quality', view.qualityGate?.passed ? 'passed' : 'failed'],
-      ['contract gate', view.contractGate?.passed ? 'passed' : 'failed'],
-      [label, mergeStateText(view.merge.success, view.merge.error, label === 'validation')],
-      ['telemetry', view.telemetryCount],
-    ]),
-    ...renderCompactSection('What To Watch', [
+
+  // Task counts table
+  const countsTable = new Table({
+    chars: TABLE_CHARS,
+    head: ['Metric', 'Value'],
+    colWidths: [22, 20],
+    style: TABLE_STYLE,
+  })
+  countsTable.push(
+    ['session', view.sessionId.slice(0, 18)],
+    ['phase', `${statusIcon(view.phase)} ${labelForPhase(view.phase)}`],
+    ['controller', view.controller],
+    ['running', `${view.taskCounts.running}`],
+    ['completed', `✅ ${view.taskCounts.completed}`],
+    ['failed', view.taskCounts.failed > 0 ? `❌ ${view.taskCounts.failed}` : `${view.taskCounts.failed}`],
+    ['blocked', view.taskCounts.blocked > 0 ? `⛔ ${view.taskCounts.blocked}` : `${view.taskCounts.blocked}`],
+    ['quality', view.qualityGate?.passed ? '✅ passed' : '❌ failed'],
+    [label, mergeStateText(view.merge.success, view.merge.error, label === 'validation')],
+  )
+
+  // MCP nodes table
+  const mcpTable = new Table({
+    chars: TABLE_CHARS,
+    head: ['MCP', 'Role', 'Status', 'Model', 'Tasks', 'Reassign'],
+    colWidths: [10, 8, 12, 12, 24, 10],
+    style: TABLE_STYLE,
+  })
+  for (const mcp of view.mcps) {
+    const taskSummary = mcp.assignedTasks.map(t => `${t.id}:${statusIcon(t.status)}`).join(' ')
+    const reassignCount = mcp.assignedTasks.reduce((n, t) => n + (t.reassignmentCount || 0), 0)
+    mcpTable.push([
+      mcp.id,
+      shortRole(mcp.roleType),
+      `${statusIcon(mcp.status)} ${mcp.status.slice(0, 6)}`,
+      mcp.activeModel.slice(0, 10),
+      taskSummary.slice(0, 22),
+      reassignCount > 0 ? `${reassignCount}x` : '—',
+    ])
+  }
+
+  const sections = [
+    uiHeader('📊', 'Parallel Dashboard'),
+    '',
+    countsTable.toString(),
+    '',
+    box('👁️  What To Watch', [
       view.summary.headline,
       `requirement: ${compactText(view.startup.requirement, 72)}`,
-      `assignments: ${view.summary.assignmentHeadline}`,
-      `roles: ${view.summary.roleHeadline}`,
-      `recent: ${compactText(view.summary.recentChange, 72)}`,
-      `next: ${view.summary.nextAction} | ${view.summary.nextReason}`,
-      ...(view.summary.blockers.length > 0 ? view.summary.blockers.map(item => `blocker: ${compactText(item, 72)}`) : ['blocker: none']),
+      `next: ${view.summary.nextAction}`,
+      ...(view.summary.blockers.length > 0 ? view.summary.blockers.map(item => `blocker: ${compactText(item, 72)}`) : []),
     ]),
-    ...renderCompactSection('Assignments', view.assignmentSummary.length > 0 ? view.assignmentSummary : ['✅ none']),
-    ...renderCompactSection('Created Roles', view.createdRoles.length > 0
-      ? view.createdRoles.map(role => `${role.mcpId} | .claude/agents/${role.file} | ${role.role} | ${role.tasks.join(', ') || 'waiting'}`)
-      : ['✅ none']),
-    ...renderProgressFocus(view),
-    ...renderCompactSection(label === 'validation' ? 'Validation Outcome' : 'Merge', renderCompactMergeBlock(view.merge, label)),
-    ...renderCompactSection('Blocked Tasks', renderCompactBlockedBlock(view.blockedTasks)),
-    ...renderCompactSection('MCP Nodes', renderCompactMcpNodeBlock(view)),
-    ...renderCompactSection('Recovery', renderCompactRecoveryBlock(view.recoverySuggestions)),
+    '',
+    mcpTable.toString(),
   ]
-  return lines.join('\n')
+
+  // Reassignment history
+  if (view.reassignmentHistory.length > 0) {
+    const reassignTable = new Table({
+      chars: TABLE_CHARS,
+      head: ['Task', 'From', 'To', 'Reason'],
+      colWidths: [10, 10, 10, 56],
+      style: TABLE_STYLE,
+    })
+    for (const r of view.reassignmentHistory.slice(-6)) {
+      reassignTable.push([r.taskId, r.fromMcpId, r.toMcpId, compactText(r.reason, 52)])
+    }
+    sections.push('', reassignTable.toString())
+  }
+
+  // Blocked tasks
+  if (view.blockedTasks.length > 0) {
+    sections.push(...renderCompactSection('Blocked Tasks', renderCompactBlockedBlock(view.blockedTasks)))
+  }
+
+  // Recovery suggestions
+  if (view.recoverySuggestions.length > 0) {
+    sections.push(...renderCompactSection('Recovery', renderCompactRecoveryBlock(view.recoverySuggestions)))
+  }
+
+  // Merge
+  sections.push(
+    '',
+    box(label === 'validation' ? '🔍 Validation Outcome' : '🔀 Merge', renderCompactMergeBlock(view.merge, label)),
+  )
+
+  return sections.join('\n')
 }
 
 function renderHeaderSummary(summary: Array<[string, string | number | boolean | undefined]>): string[] {
@@ -412,7 +683,6 @@ function renderHeaderSummary(summary: Array<[string, string | number | boolean |
   return chunks
 }
 
-
 function renderExecutionMonitoring(report: ExecutionSummaryReport): string[] {
   return [
     `total duration=${report.totalDurationMs}ms`,
@@ -421,40 +691,87 @@ function renderExecutionMonitoring(report: ExecutionSummaryReport): string[] {
   ]
 }
 
+function renderPlanningReadiness(view: DashboardView): string[] {
+  return [
+    `config: ${view.startup.config.passed ? 'passed' : 'attention'}`,
+    `preflight: ${view.preflight?.passed ? 'passed' : 'attention'}`,
+    `completeness: ${view.startup.completeness.status}`,
+    `hard blockers: ${joinList(view.startup.completeness.hardBlockers)}`,
+    `soft gaps: ${joinList(view.startup.completeness.softGaps)}`,
+    `suggestions: ${joinList(view.startup.completeness.suggestions)}`,
+  ]
+}
+
+function renderPlanningCompleteness(view: DashboardView): string[] {
+  return [
+    view.startup.completeness.summary,
+    ...view.startup.completeness.areas.map(area => `${area.key} | ${area.status} | ${area.message}`),
+  ]
+}
+
 export function renderExecutionPlan(view: DashboardView): string {
-  const lines = [
-    '🧭 Parallel Execution Plan',
-    divider(),
-    ...renderHeaderSummary([
+  const totalTasks = view.taskCounts.pending + view.taskCounts.ready + view.taskCounts.running + view.taskCounts.blocked + view.taskCounts.reviewing + view.taskCounts.completed + view.taskCounts.failed
+
+  // Task breakdown table
+  const taskTable = new Table({
+    chars: TABLE_CHARS,
+    head: ['Task', 'MCP', 'Role', 'Status', 'Title'],
+    colWidths: [10, 10, 8, 12, 46],
+    style: TABLE_STYLE,
+  })
+  for (const mcp of view.mcps) {
+    for (const task of mcp.assignedTasks) {
+      taskTable.push([
+        task.id,
+        mcp.id,
+        shortRole(mcp.roleType),
+        `${statusIcon(task.status)} ${task.status.slice(0, 6)}`,
+        compactText(task.title, 42),
+      ])
+    }
+  }
+
+  // Planning analysis
+  const a = view.planning
+  const analysisLines = [
+    `type: ${a.kind}    clarity: ${a.clarity}    risk: ${a.riskLevel}`,
+    `landing zones: ${joinList(a.likelyLandingZones).slice(0, 70)}`,
+    `recommended roles: ${joinList(a.recommendedRoles)}`,
+  ]
+
+  const sections = [
+    box('⚠️  IMPORTANT', [
+      'This is a PLAN ONLY. Do NOT start coding or implementing any tasks.',
+      'You MUST call parallel_approve to create workspaces and start execution.',
+    ]),
+    '',
+    uiHeader('🧭', 'Parallel Execution Plan (Pending Approval)'),
+    '',
+    kvBlock([
       ['session', view.sessionId],
       ['phase', labelForPhase(view.phase)],
       ['controller', view.controller],
       ['mcps', view.mcps.length],
-      ['tasks', view.taskCounts.pending + view.taskCounts.ready + view.taskCounts.running + view.taskCounts.blocked + view.taskCounts.reviewing + view.taskCounts.completed + view.taskCounts.failed],
-      ['contract gate', view.contractGate?.passed ? 'passed' : 'failed'],
-      ['preflight', view.preflight?.passed ? 'passed' : 'failed'],
+      ['tasks', totalTasks],
+      ['completeness', view.startup.completeness.status],
     ]),
-    ...renderCompactSection('Plan Summary', [
-      view.summary.headline,
-      `requirement: ${compactText(view.startup.requirement, 88)}`,
-      `next: parallel_approve | ${view.summary.nextReason}`,
+    '',
+    box('📊 Requirement Analysis', analysisLines),
+    '',
+    box('📝 Requirement', [compactText(view.startup.requirement, W - 6)]),
+    '',
+    taskTable.toString(),
+    '',
+    box('🔐 Governance', [
+      `governance: ${view.governance.status}    contracts: ${view.contracts.length}    reviews: ${view.reviewAssignments.length}`,
     ]),
-    ...renderCompactSection('Assignments', view.assignmentSummary.length > 0 ? view.assignmentSummary : ['✅ none']),
-    ...renderCompactSection('Task Breakdown', view.taskCounts.pending + view.taskCounts.ready + view.taskCounts.running + view.taskCounts.blocked + view.taskCounts.reviewing + view.taskCounts.completed + view.taskCounts.failed > 0
-      ? view.mcps.flatMap(mcp => mcp.assignedTasks.map(task => `${task.id} | ${mcp.id} [${shortRole(mcp.roleType)} → ${shortRole(assignedTaskRole(view, task.id, mcp.roleType))}] | ${task.status} | ${compactText(task.title, 60)}`))
-      : ['✅ none']),
-    ...renderCompactSection('Governance & Contracts', [
-      `governance=${view.governance.status}`,
-      `review assignments=${view.reviewAssignments.length}`,
-      `contracts=${view.contracts.length}`,
-      `contract gate=${view.contractGate?.passed ? 'passed' : 'failed'}`,
-    ]),
-    ...renderCompactSection('Approval', [
-      '当前仅完成需求拆解、任务分配与执行计划生成。',
-      '运行 parallel_approve 后才会创建角色文件、准备工作区并进入前台执行。',
+    '',
+    box('✅ Next Step', [
+      '→ Call parallel_approve to create role workspaces and begin multi-MCP execution.',
     ]),
   ]
-  return lines.join('\n')
+
+  return sections.join('\n')
 }
 
 export function renderControlExecution(options: {
@@ -484,6 +801,8 @@ export function renderControlExecution(options: {
       `requirement: ${compactText(options.view.startup.requirement, 88)}`,
       ...renderExecutionMonitoring(options.report),
     ]),
+    ...renderCompactSection('Planning Analysis', renderPlanningAnalysis(options.view)),
+    ...renderCompactSection('Reassignments', renderReassignmentSummary(options.view)),
     ...renderProgressFocus(options.view),
     ...renderCompactSection('Progress Log', renderProgressLog(options.progressEvents)),
     ...renderCompactSection('MCP Metrics', options.report.rows.map(row => `${iconForState(row.progressStatus)} ${row.mcpId} [${row.roleName}] duration=${row.durationMs}ms tokens=${row.totalTokens} model=${row.activeModel} | ${compactText(row.workContent, 88)}`)),
@@ -505,6 +824,8 @@ export function renderExecutionReport(report: ExecutionSummaryReport): string {
     ...linesFromPairs([
       ['session', report.sessionId],
       ['governance', report.governanceStatus || 'pending'],
+      ['config', report.startup?.configPassed ? 'passed' : 'attention'],
+      ['completeness', report.startup?.completeness.status || 'unknown'],
       ['duration', report.totalDurationMs],
       ['tokens', report.totalTokens],
       ['telemetry', report.telemetryCount || 0],
@@ -522,6 +843,30 @@ export function renderExecutionReport(report: ExecutionSummaryReport): string {
           : `当前 session 已输出可总结结果，适合继续复盘或收尾。`,
       `next: ${report.failedCount > 0 || report.blockedCount > 0 ? 'parallel_dashboard' : 'review current result / archive report'}`,
     ]),
+    ...renderSection('Readiness', [
+      `config: ${report.startup?.configPassed ? 'passed' : 'attention'}`,
+      `completeness: ${report.startup?.completeness.status || 'unknown'}`,
+      `hard blockers: ${joinList(report.startup?.completeness.hardBlockers || [])}`,
+      `soft gaps: ${joinList(report.startup?.completeness.softGaps || [])}`,
+      `suggestions: ${joinList(report.startup?.completeness.suggestions || [])}`,
+    ]),
+    ...renderSection('Planning Analysis', report.startup?.planning
+      ? [
+          `kind: ${report.startup.planning.kind}`,
+          `landing zones: ${joinList(report.startup.planning.likelyLandingZones)}`,
+          `recommended roles: ${joinList(report.startup.planning.recommendedRoles)}`,
+          `clarity: ${report.startup.planning.clarity}`,
+          `clarity hints: ${joinList(report.startup.planning.clarityHints)}`,
+          `risk: ${report.startup.planning.riskLevel}`,
+          `risk hints: ${joinList(report.startup.planning.riskHints)}`,
+        ]
+      : ['✅ none']),
+    ...renderSection('Project Completeness', report.startup?.completeness
+      ? [
+          report.startup.completeness.summary,
+          ...report.startup.completeness.areas.map(area => `${area.key} | ${area.status} | ${area.message}`),
+        ]
+      : ['✅ none']),
     ...renderSection(validation ? 'Validation Outcome' : 'Merge', [
       `${iconForState(report.merge.success ? 'passed' : 'failed')} ${label}: ${state}`,
       `order: ${joinList(report.merge.order)}`,

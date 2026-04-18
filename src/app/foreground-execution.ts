@@ -1,4 +1,5 @@
 import type { ExecutionSession, ExecutionSummaryReport, ParallelProgressEvent, WorkspaceDescriptor } from '../types.js'
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { ContractValidator } from '../core/contracts/contract-validator.js'
 import { executeSessionPipeline } from '../core/orchestrator.js'
 import { ReportBuilder } from '../core/report/report-builder.js'
@@ -6,7 +7,7 @@ import { buildDashboardView } from '../core/report/dashboard-view.js'
 import { SessionRuntime } from '../core/runtime/session-runtime.js'
 import { Scheduler } from '../core/scheduler/scheduler.js'
 import { createAuditRecord } from '../core/telemetry/audit-trail.js'
-import { renderControlExecution } from '../core/terminal/renderers.js'
+import { renderExecutionSummaryTable, shouldBroadcast, formatTaskProgress, formatMergeProgress, formatBatchDispatch } from '../core/terminal/ui.js'
 import { WorkspaceManager } from '../core/workspace/workspace-manager.js'
 import { buildContextSummary } from '../core/context/context-summary.js'
 
@@ -51,6 +52,7 @@ export async function runForegroundExecution(options: {
   mergeAction: string
   mergeSuccessMessage: string
   mergeFailureFallback: string
+  server?: Server
 }): Promise<{ session: ExecutionSession; report: ExecutionSummaryReport; progressEvents: ParallelProgressEvent[]; workspaceIssues: string[]; output: string }> {
   const runtime = new SessionRuntime(options.projectRoot)
   const scheduler = new Scheduler()
@@ -82,6 +84,11 @@ export async function runForegroundExecution(options: {
   runtime.save(running)
 
   const progressEvents: ParallelProgressEvent[] = []
+  const broadcast = (msg: string) => {
+    if (!options.server) return
+    options.server.sendLoggingMessage({ level: 'info', logger: 'mcp-dev-cli', data: msg }).catch(() => {})
+  }
+
   const finalSession = await executeSessionPipeline({
     projectRoot: options.projectRoot,
     session: running,
@@ -92,28 +99,31 @@ export async function runForegroundExecution(options: {
     mergeAction: options.mergeAction,
     mergeSuccessMessage: options.mergeSuccessMessage,
     mergeFailureFallback: options.mergeFailureFallback,
-    onProgress: event => {
+    onProgress: (event, session) => {
       progressEvents.push(event)
+      if (!shouldBroadcast(event)) return
+
+      if (event.kind === 'batch' && event.message.includes('dispatching') && session) {
+        broadcast(formatBatchDispatch([event], session.taskGraph.tasks))
+      } else if (event.kind === 'task') {
+        broadcast(formatTaskProgress(event))
+      } else if (event.kind === 'merge' || event.kind === 'recovery') {
+        broadcast(formatMergeProgress(event))
+      } else {
+        broadcast(`${event.kind}: ${event.message}`)
+      }
     },
   })
 
   const report = new ReportBuilder().build(finalSession)
   runtime.saveReport(report)
   const workspaceIssues = await inspectWorkspaceStates(options.projectRoot, options.workspaces)
-  const view = buildDashboardView(finalSession)
 
   return {
     session: finalSession,
     report,
     progressEvents,
     workspaceIssues,
-    output: renderControlExecution({
-      title: options.title,
-      view,
-      progressEvents,
-      report,
-      workspaceIssues,
-      nextStep: options.nextStep(finalSession),
-    }),
+    output: renderExecutionSummaryTable(report),
   }
 }

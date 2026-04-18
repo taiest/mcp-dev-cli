@@ -55,7 +55,7 @@ export class StackPolicyEngine {
     if (detected.hasRust) allowedCapabilities.add('rust')
 
     const normalizedRequirement = requirement.toLowerCase()
-    const explicitSignals = STACK_SIGNALS.filter(item => normalizedRequirement.includes(item.keyword))
+    const explicitSignals = STACK_SIGNALS.filter(item => new RegExp(`\\b${item.keyword}\\b`).test(normalizedRequirement))
     const unsupported = Array.from(new Set(
       explicitSignals
         .filter(item => !allowedCapabilities.has(item.capability))

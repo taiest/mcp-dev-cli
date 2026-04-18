@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { homedir, platform } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -9,13 +9,89 @@ export function normalizePath(p: string): string {
   return p.split(sep).join('/')
 }
 
+export function isDirectoryPath(path: string): boolean {
+  try {
+    return statSync(path).isDirectory()
+  } catch {
+    return false
+  }
+}
+
+export function looksLikeProjectRoot(path: string): boolean {
+  return existsSync(join(path, '.git'))
+    || existsSync(join(path, 'package.json'))
+    || existsSync(join(path, 'go.mod'))
+    || existsSync(join(path, 'pyproject.toml'))
+    || existsSync(join(path, 'requirements.txt'))
+    || existsSync(join(path, 'Cargo.toml'))
+    || existsSync(join(path, 'CLAUDE.md'))
+}
+
 export function findProjectRoot(startDir?: string): string {
+  const envRoot = process.env.MCP_PROJECT_ROOT
+  if (envRoot && existsSync(join(envRoot, '.git'))) return envRoot
   let dir = resolve(startDir || process.cwd())
   while (dir !== resolve(dir, '..')) {
     if (existsSync(join(dir, '.git'))) return dir
     dir = resolve(dir, '..')
   }
-  return process.cwd()
+  return envRoot || process.cwd()
+}
+
+function findClaudeWorkspaceHost(startDir?: string): string | null {
+  const normalized = normalizePath(resolve(startDir || process.cwd()))
+  const marker = '/.claude/worktrees/'
+  const markerIndex = normalized.indexOf(marker)
+  if (markerIndex === -1) return null
+  return normalized.slice(0, markerIndex)
+}
+
+export function resolveInstallProjectRoot(explicitPath?: string, startDir?: string): string {
+  if (explicitPath) return resolve(explicitPath)
+  return findClaudeWorkspaceHost(startDir) || findProjectRoot(startDir)
+}
+
+export function findInstallProjectRoot(startDir?: string): string {
+  return resolveInstallProjectRoot(undefined, startDir)
+}
+
+export function listClaudeWorktreeRoots(projectRoot: string): string[] {
+  const worktreesDir = join(projectRoot, '.claude', 'worktrees')
+  if (!existsSync(worktreesDir)) return []
+
+  try {
+    return readdirSync(worktreesDir)
+      .map(name => join(worktreesDir, name))
+      .filter(path => {
+        try {
+          return statSync(path).isDirectory() && existsSync(join(path, '.git'))
+        } catch {
+          return false
+        }
+      })
+  } catch {
+    return []
+  }
+}
+
+export function resolveMcpInstallTargets(startDir?: string, explicitPath?: string): string[] {
+  const projectRoot = resolveInstallProjectRoot(explicitPath, startDir)
+  const currentWorkspaceRoot = explicitPath ? projectRoot : findProjectRoot(startDir)
+  const targets: string[] = []
+
+  if (!targets.includes(currentWorkspaceRoot)) {
+    targets.push(currentWorkspaceRoot)
+  }
+
+  if (!targets.includes(projectRoot)) {
+    targets.push(projectRoot)
+  }
+
+  for (const worktreeRoot of listClaudeWorktreeRoots(projectRoot)) {
+    if (!targets.includes(worktreeRoot)) targets.push(worktreeRoot)
+  }
+
+  return targets
 }
 
 export function hasFile(root: string, ...paths: string[]): boolean {
@@ -56,8 +132,14 @@ export function detectTechStack(root: string): TechStack {
     stack.frameworks.push('Rust')
   }
 
-  if (hasFile(root, 'server/go.mod')) stack.frameworks.push('Go (server/)')
-  if (hasFile(root, 'miniapp/package.json')) stack.frameworks.push('Taro (miniapp/)')
+  if (hasFile(root, 'server/go.mod')) {
+    if (!stack.hasGo) stack.hasGo = true
+    stack.frameworks.push('Go (server/)')
+  }
+  if (hasFile(root, 'miniapp/package.json')) {
+    if (!stack.hasNode) stack.hasNode = true
+    stack.frameworks.push('Taro (miniapp/)')
+  }
 
   return stack
 }

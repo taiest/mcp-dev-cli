@@ -1,5 +1,6 @@
-import type { ExecutionSession, ParallelProgressEvent } from '../../types.js'
+import type { ExecutionSession, ParallelProgressEvent, ProjectCompletenessReport, ProjectConfigReport, RequirementAnalysis } from '../../types.js'
 import { MetricsAggregator } from '../telemetry/metrics-aggregator.js'
+import { PreflightScanner } from '../preflight/preflight-scanner.js'
 
 function blockedReasons(session: ExecutionSession, task: ExecutionSession['taskGraph']['tasks'][number]): string[] {
   const contractReasons = task.artifacts
@@ -44,6 +45,20 @@ function parseJsonArray<T>(raw: string | undefined, fallback: T[]): T[] {
   }
 }
 
+function defaultPlanningAnalysis(session: ExecutionSession): RequirementAnalysis {
+  const landingZones = Array.from(new Set(session.taskGraph.tasks.flatMap(task => task.files).filter(Boolean)))
+  const recommendedRoles = Array.from(new Set(session.taskGraph.tasks.map(task => task.roleType)))
+  return {
+    kind: 'feature',
+    likelyLandingZones: landingZones.length > 0 ? landingZones : ['src/**'],
+    recommendedRoles,
+    clarity: 'mixed',
+    clarityHints: [],
+    riskLevel: 'medium',
+    riskHints: [],
+  }
+}
+
 export interface DashboardView {
   sessionId: string
   phase: string
@@ -56,7 +71,10 @@ export interface DashboardView {
     updatedAt: string
     resumable: boolean
     entryHints: string[]
+    config: ProjectConfigReport
+    completeness: ProjectCompletenessReport
   }
+  planning: RequirementAnalysis
   summary: {
     headline: string
     nextAction: string
@@ -85,6 +103,7 @@ export interface DashboardView {
     conflicts: string[]
     error?: string
   }
+  reassignmentHistory: ExecutionSession['reassignmentHistory'] extends infer T ? NonNullable<T> : never
   resumeCursor: ExecutionSession['resumeCursor']
   telemetryCount: number
   taskCounts: {
@@ -117,6 +136,9 @@ export interface DashboardView {
       approvedBy: string[]
       rejectedBy: string[]
       blockedReasons: string[]
+      reassignmentCount: number
+      previousAssignments: string[]
+      lastFailureReason?: string
     }>
   }>
   contracts: Array<{
@@ -130,6 +152,9 @@ export interface DashboardView {
 }
 
 export function buildDashboardView(session: ExecutionSession): DashboardView {
+  const scanner = new PreflightScanner()
+  const config = scanner.scanConfig(session.projectRoot)
+  const completeness = scanner.scanCompleteness(session.projectRoot)
   const taskCounts = {
     pending: session.taskGraph.tasks.filter(task => task.status === 'pending').length,
     ready: session.taskGraph.tasks.filter(task => task.status === 'ready').length,
@@ -221,7 +246,10 @@ export function buildDashboardView(session: ExecutionSession): DashboardView {
       updatedAt: session.updatedAt,
       resumable: session.phase !== 'completed',
       entryHints: ['parallel_startup', 'parallel_preflight', 'parallel_start', 'parallel_approve', 'parallel_resume'],
+      config,
+      completeness,
     },
+    planning: session.taskGraph.analysis || defaultPlanningAnalysis(session),
     summary: {
       headline,
       nextAction,
@@ -263,6 +291,7 @@ export function buildDashboardView(session: ExecutionSession): DashboardView {
       conflicts: mergeResult?.conflicts || [],
       error: mergeResult?.error,
     },
+    reassignmentHistory: session.reassignmentHistory || [],
     resumeCursor: session.resumeCursor,
     telemetryCount: session.telemetry.length,
     taskCounts,
@@ -289,6 +318,9 @@ export function buildDashboardView(session: ExecutionSession): DashboardView {
           approvedBy: task.approvedBy || [],
           rejectedBy: task.rejectedBy || [],
           blockedReasons: blockedReasons(session, task),
+          reassignmentCount: task.reassignmentCount || 0,
+          previousAssignments: task.previousAssignments || [],
+          lastFailureReason: task.lastFailureReason,
         })),
     })),
     contracts: session.contracts.map(contract => ({

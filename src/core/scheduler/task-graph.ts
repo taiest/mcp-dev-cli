@@ -1,8 +1,14 @@
-import type { McpRoleType, OrchestratedTask, TaskGraph } from '../../types.js'
+import type {
+  McpRoleType,
+  OrchestratedTask,
+  RequirementAnalysis,
+  RequirementClarity,
+  RequirementKind,
+  RequirementRisk,
+  TaskGraph,
+} from '../../types.js'
 import { detectTechStack } from '../../utils/platform.js'
 import { isReadOnlyValidationText } from '../worker/validation-task.js'
-
-type RequirementKind = 'analysis' | 'docs' | 'validation' | 'bugfix' | 'refactor' | 'feature'
 
 interface TaskSeed {
   roleType: McpRoleType
@@ -41,11 +47,19 @@ export class TaskGraphBuilder {
       artifacts: [],
       contracts: seed.contracts || [],
       prompt: `${seed.description}\n\nRequirement: ${requirement}`,
+      reassignmentCount: 0,
+      previousAssignments: [],
     }))
-    return { tasks }
+    const analysis = this.buildAnalysis(kind, requirement, seeds, preferredRoles)
+    return { tasks, analysis }
   }
 
   private classifyRequirement(requirement: string): RequirementKind {
+    // Check explicit development intent first — overrides analysis keywords
+    if (this.matches(requirement, ['开发', '实现', '重构', '新增', '改造', 'implement', 'develop', 'build', 'create', 'add'])) {
+      if (this.matches(requirement, ['refactor', 'restructure', '重构'])) return 'refactor'
+      return 'feature'
+    }
     if (this.matches(requirement, ['explain', 'investigate', 'analyze', 'analysis', 'plan', '设计', '分析', '调研'])) {
       return 'analysis'
     }
@@ -267,6 +281,104 @@ export class TaskGraphBuilder {
         return this.withOptionalReviewer(seeds, includeRole('reviewer'))
       }
     }
+  }
+
+  private buildAnalysis(
+    kind: RequirementKind,
+    requirement: string,
+    seeds: TaskSeed[],
+    preferredRoles: McpRoleType[]
+  ): RequirementAnalysis {
+    const likelyLandingZones = this.buildLandingZones(kind, requirement, seeds)
+    const recommendedRoles = preferredRoles.filter(role => seeds.some(seed => seed.roleType === role))
+    const clarity = this.buildClarity(kind, requirement)
+    const clarityHints = this.buildClarityHints(kind, requirement, seeds, clarity)
+    const riskLevel = this.buildRiskLevel(kind, requirement)
+    const riskHints = this.buildRiskHints(kind, requirement)
+
+    return {
+      kind,
+      likelyLandingZones,
+      recommendedRoles,
+      clarity,
+      clarityHints,
+      riskLevel,
+      riskHints,
+    }
+  }
+
+  private buildLandingZones(kind: RequirementKind, requirement: string, seeds: TaskSeed[]): string[] {
+    const fromSeeds = Array.from(new Set(seeds.flatMap(seed => seed.files).filter(Boolean)))
+    if (fromSeeds.length > 0) return fromSeeds
+
+    const lower = requirement.toLowerCase()
+    const zones: string[] = []
+
+    if (kind === 'docs') zones.push('README.md', 'docs/**')
+    if (kind === 'validation') zones.push('src/**', 'tests/**')
+    if (kind === 'bugfix' || kind === 'refactor' || kind === 'feature') zones.push('src/**', 'tests/**')
+    if (this.matches(lower, ['api', 'contract', 'schema', 'interface', 'protocol', '接口', '契约', '协议'])) {
+      zones.push('src/**', 'contracts/**', 'schemas/**')
+    }
+    if (this.matches(lower, ['readme', 'docs', 'documentation', '文档'])) zones.push('README.md', 'docs/**')
+    if (this.matches(lower, ['config', 'env', 'setting', '配置'])) zones.push('*.json', '*.yaml', '*.yml', '.claude/**')
+
+    return Array.from(new Set(zones)).filter(Boolean)
+  }
+
+  private buildClarity(kind: RequirementKind, requirement: string): RequirementClarity {
+    if (kind === 'validation') return 'clear'
+    if (this.isAmbiguous(requirement)) return 'ambiguous'
+    if (this.isArchitectureHeavy(requirement) || this.isContractSensitive(requirement)) return 'mixed'
+    return 'clear'
+  }
+
+  private buildClarityHints(
+    kind: RequirementKind,
+    requirement: string,
+    seeds: TaskSeed[],
+    clarity: RequirementClarity
+  ): string[] {
+    const hints: string[] = []
+
+    if (clarity === 'ambiguous') {
+      hints.push('requirement wording is broad and may span multiple modules')
+    }
+    if (this.isContractSensitive(requirement)) {
+      hints.push('interface or schema impact should be confirmed before dispatch')
+    }
+    if (this.isArchitectureHeavy(requirement)) {
+      hints.push('architecture boundary is involved and should be reviewed early')
+    }
+    if (kind === 'feature' && !seeds.some(seed => seed.roleType === 'analyst')) {
+      hints.push('feature scope looks actionable with current requirement text')
+    }
+    if (kind === 'bugfix') {
+      hints.push('regression target should stay focused on the reported failure path')
+    }
+
+    return hints.length > 0 ? hints : ['requirement is specific enough to enter controlled planning']
+  }
+
+  private buildRiskLevel(kind: RequirementKind, requirement: string): RequirementRisk {
+    if (kind === 'validation' || kind === 'docs') return 'low'
+    if (kind === 'bugfix' || kind === 'refactor') return 'high'
+    if (this.isContractSensitive(requirement) || this.isArchitectureHeavy(requirement) || this.isAmbiguous(requirement)) {
+      return 'high'
+    }
+    return kind === 'analysis' ? 'medium' : 'medium'
+  }
+
+  private buildRiskHints(kind: RequirementKind, requirement: string): string[] {
+    const hints: string[] = []
+
+    if (kind === 'validation') hints.push('stay read-only and avoid repository mutations during verification')
+    if (kind === 'bugfix') hints.push('bugfix work needs regression checks before merge')
+    if (kind === 'refactor') hints.push('refactor work must preserve current behavior and contracts')
+    if (this.isContractSensitive(requirement)) hints.push('contract changes may affect multiple MCP lanes and review flow')
+    if (this.isArchitectureHeavy(requirement)) hints.push('cross-module coordination risk is higher than single-file edits')
+
+    return hints.length > 0 ? hints : ['standard planning, implementation, validation, and review flow applies']
   }
 
   private withOptionalReviewer(seeds: TaskSeed[], includeReviewer: boolean): TaskSeed[] {

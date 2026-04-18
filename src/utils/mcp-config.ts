@@ -24,12 +24,12 @@ function configPath(projectRoot: string): string {
   return join(projectRoot, '.mcp.json')
 }
 
-function expectedServerConfig(): Record<string, unknown> {
+function expectedServerConfig(projectRoot: string): Record<string, unknown> {
   return {
     type: 'stdio',
     command: 'npx',
     args: ['-y', 'mcp-dev-cli'],
-    env: {},
+    env: { MCP_PROJECT_ROOT: projectRoot },
   }
 }
 
@@ -46,10 +46,11 @@ function hasExpectedArgs(value: unknown): boolean {
 
 function isExpectedServerConfig(value: unknown): boolean {
   if (!isRecord(value)) return false
+  if (value.type !== 'stdio') return false
   if (value.command !== 'npx') return false
   if (!hasExpectedArgs(value.args)) return false
-  if ('type' in value && value.type !== 'stdio') return false
-  if ('env' in value && !isRecord(value.env)) return false
+  if (!isRecord(value.env)) return false
+  if (typeof value.env.MCP_PROJECT_ROOT !== 'string') return false
   return true
 }
 
@@ -132,11 +133,11 @@ export function normalizeProjectMcpConfig(projectRoot: string): NormalizeMcpConf
     delete servers.filesystem
   }
 
-  if (!alreadyValid) {
-    servers[MCP_DEV_CLI_SERVER_NAME] = expectedServerConfig()
-  }
+  servers[MCP_DEV_CLI_SERVER_NAME] = expectedServerConfig(projectRoot)
 
   const updated = !parsed.exists || parsed.parseError || !alreadyValid || removedLegacyFilesystemServer || !isRecord(base.mcpServers)
+    || JSON.stringify(servers[MCP_DEV_CLI_SERVER_NAME]) !== JSON.stringify(parsed.data && isRecord(parsed.data.mcpServers) ? parsed.data.mcpServers[MCP_DEV_CLI_SERVER_NAME] : undefined)
+
   if (updated) {
     writeFileSync(path, JSON.stringify({ ...base, mcpServers: servers }, null, 2) + '\n', 'utf-8')
   }

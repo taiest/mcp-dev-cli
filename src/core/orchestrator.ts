@@ -10,11 +10,14 @@ import type {
   ReviewArtifact,
   SessionPhase,
   TaskGraph,
+  TaskReassignmentRecord,
   TelemetryEvent,
   WorkspaceDescriptor,
 } from '../types.js'
 import { SessionRuntime } from './runtime/session-runtime.js'
+import { SessionStore } from './runtime/session-store.js'
 import { Scheduler } from './scheduler/scheduler.js'
+import { AssignmentEngine } from './scheduler/assignment-engine.js'
 import { PolicyEngine } from './policy/policy-engine.js'
 import { WorkerRunner } from './worker/worker-runner.js'
 import { QualityGate } from './quality/quality-gate.js'
@@ -116,8 +119,9 @@ export function withTaskRunning(session: ExecutionSession, task: OrchestratedTas
   }
 }
 
-export function withTaskStatus(session: ExecutionSession, taskId: string, status: OrchestratedTaskStatus, output: string): ExecutionSession {
+export function withTaskStatus(session: ExecutionSession, taskId: string, status: OrchestratedTaskStatus, output: string, failureReason?: string): ExecutionSession {
   const updatedTaskGraph: TaskGraph = {
+    ...session.taskGraph,
     tasks: session.taskGraph.tasks.map(item =>
       item.id === taskId
         ? {
@@ -129,6 +133,7 @@ export function withTaskStatus(session: ExecutionSession, taskId: string, status
                 : item.governanceStatus
               : item.governanceStatus,
             artifacts: output ? [...item.artifacts, `output:${taskId}`] : item.artifacts,
+            lastFailureReason: status === 'failed' ? failureReason || 'task execution failed' : item.lastFailureReason,
           }
         : item
     ),
@@ -369,13 +374,81 @@ export async function executeSessionPipeline(options: {
       })
     )
 
+    const assignmentEngine = new AssignmentEngine()
     for (const { task, result } of results) {
-      const nextStatus: OrchestratedTaskStatus = result.success ? 'completed' : 'failed'
-      running = withTaskStatus(running, task.id, nextStatus, result.output)
+      let nextStatus: OrchestratedTaskStatus = result.success ? 'completed' : 'failed'
+
+      // Mid-execution reassignment: if task failed and hasn't exceeded retry limit, try to reassign
+      if (!result.success && (task.reassignmentCount || 0) < 2) {
+        const replacement = assignmentEngine.pickReplacement(task, running.mcps, task.assignedMcpId)
+        if (replacement) {
+          const record: TaskReassignmentRecord = {
+            taskId: task.id,
+            fromMcpId: task.assignedMcpId || 'unknown',
+            toMcpId: replacement.id,
+            reason: result.telemetry.message || 'task failed, auto-reassigned',
+            timestamp: new Date().toISOString(),
+          }
+          running = {
+            ...running,
+            reassignmentHistory: [...(running.reassignmentHistory || []), record],
+            taskGraph: {
+              ...running.taskGraph,
+              tasks: running.taskGraph.tasks.map(t => t.id === task.id ? {
+                ...t,
+                status: 'pending' as OrchestratedTaskStatus,
+                assignedMcpId: replacement.id,
+                reassignmentCount: (t.reassignmentCount || 0) + 1,
+                lastFailureReason: result.telemetry.message,
+                previousAssignments: [...(t.previousAssignments || []), task.assignedMcpId || 'unknown'],
+              } : t),
+            },
+          }
+          running = runtime.appendAudit(running, [createAuditRecord({
+            sessionId: running.sessionId,
+            scope: 'recovery',
+            action: 'mid-execution-reassign',
+            status: 'passed',
+            actor: running.controllerMcpId,
+            mcpId: replacement.id,
+            taskId: task.id,
+            message: `reassigned ${task.id} from ${task.assignedMcpId} to ${replacement.id}: ${result.telemetry.message || 'failed'}`,
+          })])
+          options.onProgress?.(progressEvent('recovery', `${task.id} reassigned: ${task.assignedMcpId} → ${replacement.id}`, {
+            taskId: task.id,
+            mcpId: replacement.id,
+            status: 'reassigned',
+          }), running)
+          runtime.save(running)
+          continue // skip marking as failed — task will re-enter runnable queue
+        }
+      }
+
+      running = withTaskStatus(running, task.id, nextStatus, result.output, result.success ? undefined : result.telemetry.message)
       running = runtime.appendTelemetry(running, result.telemetry)
       running = runtime.appendAudit(running, [
         taskAudit(running.sessionId, task, options.taskAction, result.success ? 'passed' : 'failed', result.telemetry.message),
       ])
+
+      // Save context snapshot for completed/failed tasks
+      const now = new Date()
+      const store = new SessionStore(options.projectRoot)
+      store.saveTaskContext({
+        mcpId: task.assignedMcpId || 'unknown',
+        taskId: task.id,
+        sessionId: running.sessionId,
+        roleType: task.roleType,
+        title: task.title,
+        requirement: running.requirement,
+        status: nextStatus,
+        output: (result.output || '').slice(0, 4000),
+        files: task.files || [],
+        durationMs: result.telemetry.durationMs || 0,
+        tokens: result.telemetry.totalTokens || 0,
+        timestamp: now.toISOString(),
+        createdAt: now.toISOString().replace('T', ' ').slice(0, 19),
+      })
+
       const taskFinished = progressEvent('task', `${task.id} ${nextStatus}`, {
         phase: running.phase,
         taskId: task.id,

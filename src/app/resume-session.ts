@@ -2,8 +2,9 @@ import { SessionRuntime } from '../core/runtime/session-runtime.js'
 import { buildDashboardView } from '../core/report/dashboard-view.js'
 import { renderExecutionPlan, renderSessionOutcome } from '../core/terminal/renderers.js'
 import { parseWorkspaceMap, runForegroundExecution } from './foreground-execution.js'
+import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 
-export async function resumeSession(projectRoot: string): Promise<string> {
+export async function resumeSession(projectRoot: string, server?: Server): Promise<string> {
   const runtime = new SessionRuntime(projectRoot)
   const session = runtime.resume()
   if (!session) {
@@ -59,6 +60,7 @@ export async function resumeSession(projectRoot: string): Promise<string> {
     mergeAction: 'resume-merge-session',
     mergeSuccessMessage: 'merge completed during resume',
     mergeFailureFallback: 'merge failed during resume',
+    server,
   })
 
   return execution.output

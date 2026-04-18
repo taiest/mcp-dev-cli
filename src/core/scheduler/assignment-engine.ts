@@ -16,24 +16,7 @@ export class AssignmentEngine {
     }
 
     const withAssignment = tasks.map(task => {
-      const exactRole = mcps.filter(mcp => mcp.roleType === task.roleType)
-      const developerPool = mcps.filter(mcp => mcp.roleType === 'developer')
-      const fallbackRoles: McpRoleType[] = task.roleType === 'reviewer'
-        ? ['reviewer', 'controller', 'architect', 'developer']
-        : task.roleType === 'tester'
-          ? ['tester', 'developer']
-          : task.roleType === 'architect'
-            ? ['architect', 'analyst', 'developer']
-            : task.roleType === 'analyst'
-              ? ['analyst', 'architect', 'developer']
-              : ['developer', 'architect', 'analyst']
-      const fallbackPool = mcps.filter(mcp => fallbackRoles.includes(mcp.roleType))
-      const nonControllerPool = mcps.filter(mcp => mcp.roleType !== 'controller')
-      const assigned = pickLeastLoaded(exactRole)
-        || pickLeastLoaded(fallbackPool)
-        || pickLeastLoaded(developerPool)
-        || pickLeastLoaded(nonControllerPool)
-        || pickLeastLoaded(mcps)
+      const assigned = this.pickCandidate(task, mcps, load)
 
       if (assigned) {
         load.set(assigned.id, (load.get(assigned.id) || 0) + 1)
@@ -47,5 +30,40 @@ export class AssignmentEngine {
     })
 
     return withAssignment
+  }
+
+  pickReplacement(task: OrchestratedTask, mcps: McpNode[], excludeMcpId?: string): McpNode | undefined {
+    const eligible = mcps.filter(mcp => mcp.id !== excludeMcpId && mcp.status !== 'failed')
+    if (eligible.length === 0) return undefined
+    const load = new Map(eligible.map(mcp => [mcp.id, 0]))
+    return this.pickCandidate(task, eligible, load)
+  }
+
+  private pickCandidate(task: OrchestratedTask, mcps: McpNode[], load: Map<string, number>): McpNode | undefined {
+    const pickLeastLoaded = (candidates: McpNode[]): McpNode | undefined => {
+      return [...candidates].sort((left, right) => {
+        const loadDiff = (load.get(left.id) || 0) - (load.get(right.id) || 0)
+        return loadDiff || compareByPriority(left, right)
+      })[0]
+    }
+
+    const exactRole = mcps.filter(mcp => mcp.roleType === task.roleType)
+    const developerPool = mcps.filter(mcp => mcp.roleType === 'developer')
+    const fallbackRoles: McpRoleType[] = task.roleType === 'reviewer'
+      ? ['reviewer', 'controller', 'architect', 'developer']
+      : task.roleType === 'tester'
+        ? ['tester', 'developer']
+        : task.roleType === 'architect'
+          ? ['architect', 'analyst', 'developer']
+          : task.roleType === 'analyst'
+            ? ['analyst', 'architect', 'developer']
+            : ['developer', 'architect', 'analyst']
+    const fallbackPool = mcps.filter(mcp => fallbackRoles.includes(mcp.roleType))
+    const nonControllerPool = mcps.filter(mcp => mcp.roleType !== 'controller')
+    return pickLeastLoaded(exactRole)
+      || pickLeastLoaded(fallbackPool)
+      || pickLeastLoaded(developerPool)
+      || pickLeastLoaded(nonControllerPool)
+      || pickLeastLoaded(mcps)
   }
 }

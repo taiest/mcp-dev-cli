@@ -1,4 +1,4 @@
-import type { ExecutionSession, McpNodeStatus, OrchestratedTask } from '../../types.js'
+import type { ExecutionSession, McpNodeStatus, OrchestratedTask, TaskReassignmentRecord } from '../../types.js'
 import { AssignmentEngine } from './assignment-engine.js'
 import { ReviewCoordinator } from './review-coordinator.js'
 import { BlockerCoordinator } from './blocker-coordinator.js'
@@ -30,6 +30,10 @@ function buildInvalidatedTaskIds(session: ExecutionSession): Set<string> {
   return invalidated
 }
 
+function now(): string {
+  return new Date().toISOString()
+}
+
 export class Scheduler {
   private assignment = new AssignmentEngine()
   private review = new ReviewCoordinator()
@@ -41,9 +45,9 @@ export class Scheduler {
     const withAssignments: ExecutionSession = {
       ...session,
       phase: session.preflight?.passed === false ? 'failed' : 'running',
-      taskGraph: { tasks: assignedTasks },
+      taskGraph: { ...session.taskGraph, tasks: assignedTasks },
       mcps: session.mcps.map(mcp => ({ ...mcp, status: assignedTasks.some(task => task.assignedMcpId === mcp.id) ? 'assigned' : mcp.status })),
-      resumeCursor: { phase: 'running', taskIds: this.blockers.findBlockedTasks({ ...session, taskGraph: { tasks: assignedTasks } }) },
+      resumeCursor: { phase: 'running', taskIds: this.blockers.findBlockedTasks({ ...session, taskGraph: { ...session.taskGraph, tasks: assignedTasks } }) },
     }
 
     const withContracts = this.contracts.attach(withAssignments, session.contracts)
@@ -53,9 +57,16 @@ export class Scheduler {
 
   requeueRecoverable(session: ExecutionSession): ExecutionSession {
     const invalidatedTaskIds = buildInvalidatedTaskIds(session)
+    const reassignmentHistory: TaskReassignmentRecord[] = [...(session.reassignmentHistory || [])]
     const recoveredTasks: OrchestratedTask[] = session.taskGraph.tasks.map(task => {
-      if (task.status === 'failed') {
-        return {
+      const failedOrInvalidated = task.status === 'failed' || invalidatedTaskIds.has(task.id)
+      const shouldResetBlocked = task.status === 'blocked' && !this.isContractBlocked(task)
+      const shouldResetReviewer = task.status === 'completed' && task.roleType === 'reviewer' && (session.reviewApprovals?.length || 0) === 0
+
+      let nextTask: OrchestratedTask = task
+
+      if (failedOrInvalidated) {
+        nextTask = {
           ...task,
           status: 'pending',
           governanceStatus: task.reviewRequired ? 'review_required' : 'pending',
@@ -63,36 +74,45 @@ export class Scheduler {
           rejectedBy: [],
           artifacts: task.artifacts.filter(item => !item.startsWith('output:')),
         }
-      }
-
-      if (invalidatedTaskIds.has(task.id)) {
-        return {
-          ...task,
-          status: 'pending',
-          governanceStatus: task.reviewRequired ? 'review_required' : 'pending',
-          approvedBy: [],
-          rejectedBy: [],
-          artifacts: task.artifacts.filter(item => !item.startsWith('output:')),
-        }
-      }
-
-      if (task.status === 'blocked' && !this.isContractBlocked(task)) {
-        return {
+      } else if (shouldResetBlocked) {
+        nextTask = {
           ...task,
           status: 'pending',
           governanceStatus: task.reviewRequired ? 'review_required' : 'pending',
         }
-      }
-
-      if (task.status === 'completed' && task.roleType === 'reviewer' && (session.reviewApprovals?.length || 0) === 0) {
-        return {
+      } else if (shouldResetReviewer) {
+        nextTask = {
           ...task,
           status: 'pending',
           artifacts: task.artifacts.filter(item => !item.startsWith('output:')),
         }
       }
 
-      return task
+      if (!failedOrInvalidated || !task.assignedMcpId) return nextTask
+
+      const replacement = this.assignment.pickReplacement(task, session.mcps, task.assignedMcpId)
+      if (!replacement || replacement.id === task.assignedMcpId) {
+        return {
+          ...nextTask,
+          lastFailureReason: task.lastFailureReason || `resume requested after failure on ${task.assignedMcpId}`,
+        }
+      }
+
+      reassignmentHistory.push({
+        taskId: task.id,
+        fromMcpId: task.assignedMcpId,
+        toMcpId: replacement.id,
+        reason: task.lastFailureReason || `resume requested after failure on ${task.assignedMcpId}`,
+        timestamp: now(),
+      })
+
+      return {
+        ...nextTask,
+        assignedMcpId: replacement.id,
+        reassignmentCount: (task.reassignmentCount || 0) + 1,
+        lastFailureReason: task.lastFailureReason || `resume requested after failure on ${task.assignedMcpId}`,
+        previousAssignments: Array.from(new Set([...(task.previousAssignments || []), task.assignedMcpId])),
+      }
     })
 
     const recoveredSession: ExecutionSession = {
@@ -100,11 +120,12 @@ export class Scheduler {
       phase: 'running',
       reviewArtifacts: invalidatedTaskIds.size > 0 ? [] : session.reviewArtifacts,
       reviewApprovals: invalidatedTaskIds.size > 0 ? [] : session.reviewApprovals,
+      reassignmentHistory,
       mcps: session.mcps.map(mcp => ({
         ...mcp,
         status: this.recoverNodeStatus(mcp.status),
       })),
-      taskGraph: { tasks: recoveredTasks },
+      taskGraph: { ...session.taskGraph, tasks: recoveredTasks },
       resumeCursor: {
         phase: 'running',
         taskIds: recoveredTasks.filter(task => task.status !== 'completed').map(task => task.id),
@@ -125,10 +146,10 @@ export class Scheduler {
     const nextSession: ExecutionSession = {
       ...session,
       phase: session.phase,
-      taskGraph: { tasks },
+      taskGraph: { ...session.taskGraph, tasks },
       resumeCursor: {
         phase: session.phase,
-        taskIds: this.blockers.findBlockedTasks({ ...session, taskGraph: { tasks } }),
+        taskIds: this.blockers.findBlockedTasks({ ...session, taskGraph: { ...session.taskGraph, tasks } }),
       },
     }
 

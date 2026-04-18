@@ -6,6 +6,7 @@ import type {
   McpNode,
   PreflightReport,
   ProjectDiscovery,
+  RequirementDraft,
   StartupFlowState,
   StartupFlowStep,
   TaskGraph,
@@ -16,6 +17,7 @@ import { ResumeRebuilder } from './resume-rebuilder.js'
 import { detectTechStack, getGitInfo, hasClaudeMd, hasMcpConfig, hasParallelPlatform } from '../../utils/platform.js'
 import { PreflightScanner } from '../preflight/preflight-scanner.js'
 import { appendAuditRecords, createAuditRecord } from '../telemetry/audit-trail.js'
+import { TaskGraphBuilder } from '../scheduler/task-graph.js'
 
 export class SessionRuntime {
   private store: SessionStore
@@ -123,18 +125,35 @@ export class SessionRuntime {
     this.store.saveReport(report)
   }
 
+  saveRequirementDraft(requirement: string): RequirementDraft {
+    return this.store.saveRequirementDraft(requirement)
+  }
+
+  loadRequirementDraft(): RequirementDraft | null {
+    return this.store.loadRequirementDraft()
+  }
+
+  clearRequirementDraft(): void {
+    this.store.clearRequirementDraft()
+  }
+
   async buildStartupFlow(): Promise<StartupFlowState> {
     const scanner = new PreflightScanner()
     const discovery = this.buildProjectDiscovery()
     const config = scanner.scanConfig(this.projectRoot)
     const preflight = await scanner.scan(this.projectRoot)
+    const completeness = scanner.scanCompleteness(this.projectRoot)
 
     const recentSessions = this.store.listSessionHistory()
     const templates = this.store.listStartupTemplates()
+    const requirementDraft = this.store.loadRequirementDraft()
+    const requirementAnalysis = requirementDraft
+      ? new TaskGraphBuilder().build(requirementDraft.requirement, this.projectRoot).analysis
+      : undefined
     const activeSession = this.load()
     const requiresApproval = Boolean(activeSession && activeSession.phase === 'planning')
     const hasResumable = recentSessions.some(item => item.resumable) || (activeSession ? activeSession.phase !== 'completed' && activeSession.phase !== 'planning' : false)
-    const canStartNew = discovery.hasGit && config.passed && preflight.passed && !requiresApproval
+    const canStartNew = discovery.hasGit && config.passed && preflight.passed && completeness.status !== 'blocked' && !requiresApproval
 
     const entries = {
       approve: requiresApproval
@@ -142,7 +161,7 @@ export class SessionRuntime {
         : { available: false, reason: '当前没有待审批的 planning session。' },
       newSession: canStartNew
         ? { available: true }
-        : { available: false, reason: requiresApproval ? '当前已有待审批 session，需先 approve 再执行。' : '存在未通过的 discovery/config/preflight 项，需要先修复。' },
+        : { available: false, reason: requiresApproval ? '当前已有待审批 session，需先 approve 再执行。' : '存在未通过的 discovery/config/preflight/completeness 项，需要先修复。' },
       resume: hasResumable
         ? { available: true }
         : { available: false, reason: '当前没有可继续的 session。' },
@@ -179,6 +198,30 @@ export class SessionRuntime {
         nextStep: check.nextStep,
       })),
       {
+        key: 'completeness',
+        title: 'Project completeness',
+        status: completeness.status === 'ready' ? 'completed' : completeness.status === 'warning' ? 'warning' : 'failed',
+        message: completeness.summary,
+        blocking: completeness.status === 'blocked',
+        nextStep: completeness.hardBlockers.length > 0 ? completeness.hardBlockers[0] : completeness.suggestions[0],
+      },
+      {
+        key: 'requirement',
+        title: 'Requirement input',
+        status: requirementDraft ? 'completed' : canStartNew ? 'ready' : 'warning',
+        message: requirementDraft
+          ? `已记录需求：${requirementDraft.requirement}`
+          : canStartNew
+            ? '当前可录入本轮项目需求。'
+            : '当前还不能录入需求并进入 planning。',
+        blocking: false,
+        nextStep: requirementDraft
+          ? '运行 parallel_start 生成主控分析与执行计划。'
+          : canStartNew
+            ? '运行 parallel_requirement 先保存需求。'
+            : undefined,
+      },
+      {
         key: 'launch',
         title: 'Launch readiness',
         status: requiresApproval ? 'warning' : canStartNew ? 'ready' : 'warning',
@@ -208,47 +251,62 @@ export class SessionRuntime {
           ? 'ready'
           : 'blocked'
     const canAcceptRequirement = developmentStatus === 'ready'
-    const requirementPrompt = canAcceptRequirement
-      ? '已连接并可开始开发。请直接在对话框输入需求并回车，然后调用 parallel_start。'
-      : undefined
+    const requirementPrompt = requirementDraft
+      ? `已录入需求，可直接 planning：${requirementDraft.requirement}`
+      : canAcceptRequirement
+        ? '已连接并可开始开发。先运行 parallel_requirement 录入本轮项目需求，再调用 parallel_start。'
+        : undefined
     const summary = !discovery.hasGit
       ? '当前目录还不是可用的 Git 项目，先修正项目根目录。'
       : requiresApproval
         ? '检测到待审批的 planning session，先确认执行计划再进入主控执行。'
         : entries.resume.available
           ? '检测到可恢复 session，优先回到已有工作流继续推进。'
-          : shouldInitFirst
-            ? '当前仓库还没完成 parallel 平台初始化，建议先补齐基础结构再启动 session。'
-            : entries.newSession.available
-              ? '当前项目已准备就绪，可以直接启动新的并行 session。'
-              : entries.template.available
-                ? '当前不适合直接启动，先从模板或修复建议入手。'
-                : '当前项目还有阻塞项，先处理 startup / preflight 提示。'
+          : completeness.status === 'blocked'
+            ? '当前项目完整度存在硬阻塞，先补齐基础模块再进入 planning。'
+            : shouldInitFirst
+              ? '当前仓库还没完成 parallel 平台初始化，建议先补齐基础结构再启动 session。'
+              : !requirementDraft
+                ? '当前项目已准备就绪，下一步先录入项目需求。'
+                : entries.newSession.available
+                  ? '当前项目与需求都已准备就绪，可以生成新的并行计划。'
+                  : entries.template.available
+                    ? '当前不适合直接启动，先从模板或修复建议入手。'
+                    : '当前项目还有阻塞项，先处理 startup / preflight 提示。'
     const recommendedAction = requiresApproval
       ? 'parallel_approve'
       : entries.resume.available
         ? 'parallel_resume'
         : shouldInitFirst
           ? 'parallel_init'
-          : recommendedEntry === 'new'
-            ? 'parallel_start'
-            : 'parallel_init'
+          : completeness.status === 'blocked'
+            ? 'parallel_preflight'
+            : !requirementDraft && entries.newSession.available
+              ? 'parallel_requirement'
+              : recommendedEntry === 'new'
+                ? 'parallel_start'
+                : 'parallel_init'
     const recommendedReason = requiresApproval
       ? '已有需求拆解与任务分配结果，先审批后执行可保持主控流清晰。'
       : entries.resume.available
         ? '已有未完成 session，可直接恢复当前进度。'
         : shouldInitFirst
           ? '当前仓库缺少 parallel 平台目录或基础初始化文件，先初始化更稳妥。'
-          : recommendedEntry === 'new'
-            ? 'discovery、config、preflight 已满足启动条件。'
-            : entries.template.reason || entries.newSession.reason || '当前更适合先初始化或修复阻塞项。'
+          : completeness.status === 'blocked'
+            ? '项目关键模块缺失，先做完整度修复比直接派发任务更稳妥。'
+            : !requirementDraft && entries.newSession.available
+              ? '主控 planning 前需要先拿到本轮明确需求。'
+              : recommendedEntry === 'new'
+                ? 'discovery、config、preflight、completeness 与 requirement 已满足启动条件。'
+                : entries.template.reason || entries.newSession.reason || '当前更适合先初始化或修复阻塞项。'
     const nextActions = [
       recommendedAction,
       ...(requiresApproval ? ['parallel_dashboard'] : []),
       ...(!discovery.initialized ? ['parallel_init'] : []),
-      ...(!config.passed || !preflight.passed ? ['parallel_preflight'] : []),
+      ...(!config.passed || !preflight.passed || completeness.status !== 'ready' ? ['parallel_preflight'] : []),
+      ...(!requirementDraft && entries.newSession.available ? ['parallel_requirement'] : []),
+      ...(requirementDraft && entries.newSession.available && recommendedAction !== 'parallel_start' ? ['parallel_start'] : []),
       ...(entries.resume.available && !requiresApproval ? ['parallel_dashboard'] : []),
-      ...(recommendedAction !== 'parallel_start' && entries.newSession.available ? ['parallel_start'] : []),
     ].filter((action, index, list) => list.indexOf(action) === index)
 
     return {
@@ -256,8 +314,11 @@ export class SessionRuntime {
       discovery,
       config,
       preflight,
+      completeness,
       recentSessions,
       templates,
+      requirementDraft,
+      requirementAnalysis,
       entries,
       connectionStatus: 'connected',
       developmentStatus,

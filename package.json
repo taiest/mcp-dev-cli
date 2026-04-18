@@ -1,6 +1,6 @@
 {
   "name": "mcp-dev-cli",
-  "version": "0.5.1",
+  "version": "0.7.0",
   "description": "MCP Server — unified parallel development platform. Structured startup flow, governed multi-role sessions, audit trail, recovery, dashboard, and report export for Claude Code.",
   "type": "module",
   "bin": {
@@ -31,6 +31,7 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "cli-table3": "^0.6.5",
     "execa": "^9.5.2",
     "fs-extra": "^11.2.0",
     "handlebars": "^4.7.8",

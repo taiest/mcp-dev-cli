@@ -176,9 +176,31 @@ export function summarizeCreatedRoles(roles: Array<{ mcpId: string; file: string
   return roles.map(role => `${role.mcpId} -> .claude/agents/${role.file} [${role.role}] ${role.tasks.length > 0 ? `${role.tasks.length} tasks` : 'waiting'}`)
 }
 
-export async function startParallelSession(requirement: string, projectRoot: string, mcpCount = 6): Promise<string> {
-  const preflight = await new PreflightScanner().scan(projectRoot)
+export async function startParallelSession(requirementInput: string | undefined, projectRoot: string, mcpCount = 6): Promise<string> {
   const runtime = new SessionRuntime(projectRoot)
+  const draft = runtime.loadRequirementDraft()
+  const requirement = (requirementInput || draft?.requirement || '').trim()
+
+  if (!requirement) {
+    const startup = await runtime.buildStartupFlow()
+    return renderSessionOutcome({
+      action: 'blocked',
+      sessionId: 'requirement-missing',
+      phase: 'planning',
+      summary: [['startup', startup.developmentStatus], ['recommended', startup.recommendedAction]],
+      sections: [{
+        title: 'Requirement Input',
+        lines: [
+          'No requirement draft found.',
+          'Use parallel_requirement to capture the project requirement first, or pass requirement directly to parallel_start.',
+        ],
+      }],
+      nextStep: 'Run parallel_requirement, then rerun parallel_start.',
+    })
+  }
+
+  runtime.saveRequirementDraft(requirement)
+  const preflight = await new PreflightScanner().scan(projectRoot)
   const scheduler = new Scheduler()
   const policy = new PolicyEngine()
   const mcps = buildDefaultMcps(mcpCount)
@@ -244,7 +266,7 @@ export async function startParallelSession(requirement: string, projectRoot: str
           ],
         },
       ],
-      nextStep: 'Run parallel_preflight and resolve failed checks before starting a new session.',
+      nextStep: 'Run parallel_preflight, fix failed checks or hard blockers, then rerun parallel_start.',
     })
   }
 
@@ -266,6 +288,7 @@ export async function startParallelSession(requirement: string, projectRoot: str
     },
   }
   runtime.save(planned)
+  runtime.clearRequirementDraft()
 
   return renderExecutionPlan(buildDashboardView(planned))
 }

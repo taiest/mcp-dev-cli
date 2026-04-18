@@ -1,5 +1,6 @@
 import type { ExecutionSession, ExecutionSummaryReport } from '../../types.js'
 import { MetricsAggregator } from '../telemetry/metrics-aggregator.js'
+import { PreflightScanner } from '../preflight/preflight-scanner.js'
 
 function formatMergeSummary(report: ExecutionSummaryReport): string {
   const failed = report.merge.failed.map(item => `${item.branch}${item.error ? `(${item.error})` : ''}`).join(', ') || 'none'
@@ -26,18 +27,38 @@ export class ReportBuilder {
   private aggregator = new MetricsAggregator()
 
   build(session: ExecutionSession): ExecutionSummaryReport {
+    const scanner = new PreflightScanner()
+    const config = scanner.scanConfig(session.projectRoot)
+    const completeness = scanner.scanCompleteness(session.projectRoot)
     const report = this.aggregator.build(session)
     const blockedReasons = session.taskGraph.tasks
       .filter(task => task.status === 'blocked')
       .flatMap(task => task.artifacts.filter(item => item.startsWith('blocked-by-contract:')).map(reason => `${task.id}:${reason}`))
     const mergeSummary = formatMergeSummary(report)
     const monitoringSummary = formatMonitoringSummary(report)
+    const planningAnalysis = session.taskGraph.analysis
+      ? [
+          `plan-kind=${session.taskGraph.analysis.kind}`,
+          `landing=${session.taskGraph.analysis.likelyLandingZones.join(', ') || 'none'}`,
+          `roles=${session.taskGraph.analysis.recommendedRoles.join(', ') || 'none'}`,
+          `clarity=${session.taskGraph.analysis.clarity}`,
+          `risk=${session.taskGraph.analysis.riskLevel}`,
+        ].join(' | ')
+      : 'plan=none'
+    const reassignmentSummary = (session.reassignmentHistory || []).length > 0
+      ? `reassignments=${session.reassignmentHistory!.map(item => `${item.taskId}:${item.fromMcpId}->${item.toMcpId}`).join(', ')}`
+      : 'reassignments=none'
 
     return {
       ...report,
+      startup: {
+        configPassed: config.passed,
+        completeness,
+        planning: session.taskGraph.analysis,
+      },
       rows: report.rows.map(row => {
         const relatedBlocked = blockedReasons.filter(reason => session.taskGraph.tasks.some(task => task.assignedMcpId === row.mcpId && reason.startsWith(`${task.id}:`)))
-        const extras = [mergeSummary, monitoringSummary, `governance=${report.governanceStatus || 'pending'}`]
+        const extras = [mergeSummary, monitoringSummary, planningAnalysis, reassignmentSummary, `governance=${report.governanceStatus || 'pending'}`]
         if (relatedBlocked.length > 0) {
           extras.unshift(`blocked=${relatedBlocked.join(', ')}`)
         }

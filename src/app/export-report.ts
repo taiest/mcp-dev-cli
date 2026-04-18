@@ -8,15 +8,20 @@ export async function exportParallelReport(projectRoot: string): Promise<string>
   const runtime = new SessionRuntime(projectRoot)
   const session = runtime.load()
   if (!session) {
+    const startup = await runtime.buildStartupFlow()
     return [
       '🧾 Parallel Report',
       '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
       '当前没有可导出的 parallel session report。',
       '',
-      '建议下一步：',
-      '- 先运行 parallel_startup，确认当前项目是否已有可恢复 session。',
-      '- 如果只是想看当前状态，运行 parallel_dashboard。',
-      '- 如果还没有启动 session，运行 parallel_start。',
+      'What To Do Next',
+      ...[
+        startup.summary,
+        `development: ${startup.developmentStatus}`,
+        `completeness: ${startup.completeness.status}`,
+        `recommended tool: ${startup.recommendedAction}`,
+        `next: ${startup.nextActions.join(', ') || 'none'}`,
+      ].map(line => `  ${line}`),
     ].join('\n')
   }
 

@@ -164,6 +164,9 @@ export const CONTEXT_FILES = {
 // ─── 新版并行平台类型 ─────────────────────────────────────
 
 export type McpRoleType = 'controller' | 'developer' | 'tester' | 'analyst' | 'architect' | 'reviewer'
+export type RequirementKind = 'analysis' | 'docs' | 'validation' | 'bugfix' | 'refactor' | 'feature'
+export type RequirementClarity = 'clear' | 'mixed' | 'ambiguous'
+export type RequirementRisk = 'low' | 'medium' | 'high'
 export type McpNodeStatus = 'idle' | 'assigned' | 'running' | 'blocked' | 'failed' | 'completed'
 export type OrchestratedTaskStatus = 'pending' | 'ready' | 'running' | 'blocked' | 'reviewing' | 'completed' | 'failed'
 export type SessionPhase = 'planning' | 'preflight' | 'running' | 'reviewing' | 'merging' | 'completed' | 'failed'
@@ -255,6 +258,27 @@ export interface OrchestratedTask {
   artifacts: string[]
   contracts: string[]
   prompt: string
+  reassignmentCount?: number
+  lastFailureReason?: string
+  previousAssignments?: string[]
+}
+
+export interface RequirementAnalysis {
+  kind: RequirementKind
+  likelyLandingZones: string[]
+  recommendedRoles: McpRoleType[]
+  clarity: RequirementClarity
+  clarityHints: string[]
+  riskLevel: RequirementRisk
+  riskHints: string[]
+}
+
+export interface TaskReassignmentRecord {
+  taskId: string
+  fromMcpId: string
+  toMcpId: string
+  reason: string
+  timestamp: string
 }
 
 export interface ContractArtifact {
@@ -269,6 +293,7 @@ export interface ContractArtifact {
 
 export interface TaskGraph {
   tasks: OrchestratedTask[]
+  analysis?: RequirementAnalysis
 }
 
 export interface PreflightCheckResult {
@@ -295,6 +320,22 @@ export interface ProjectConfigCheck {
 export interface ProjectConfigReport {
   passed: boolean
   checks: ProjectConfigCheck[]
+}
+
+export interface ProjectCompletenessArea {
+  key: string
+  title: string
+  status: 'present' | 'partial' | 'missing'
+  message: string
+}
+
+export interface ProjectCompletenessReport {
+  status: 'ready' | 'warning' | 'blocked'
+  summary: string
+  hardBlockers: string[]
+  softGaps: string[]
+  suggestions: string[]
+  areas: ProjectCompletenessArea[]
 }
 
 export interface ProjectDiscovery {
@@ -324,6 +365,12 @@ export interface StartupTemplate {
   requirement: string
 }
 
+export interface RequirementDraft {
+  requirement: string
+  capturedAt: string
+  source: 'tool'
+}
+
 export interface StartupFlowStep {
   key: string
   title: string
@@ -339,8 +386,11 @@ export interface StartupFlowState {
   discovery: ProjectDiscovery
   config: ProjectConfigReport
   preflight: PreflightReport
+  completeness: ProjectCompletenessReport
   recentSessions: SessionHistoryEntry[]
   templates: StartupTemplate[]
+  requirementDraft: RequirementDraft | null
+  requirementAnalysis?: RequirementAnalysis
   entries: {
     approve: {
       available: boolean
@@ -472,6 +522,7 @@ export interface ExecutionSession {
   auditTrail?: AuditRecord[]
   telemetry: TelemetryEvent[]
   artifacts: Record<string, string>
+  reassignmentHistory?: TaskReassignmentRecord[]
   resumeCursor: {
     phase: SessionPhase
     taskIds: string[]
@@ -536,6 +587,11 @@ export interface ExecutionSummaryReport {
   warningCount?: number
   failureCount?: number
   monitoring?: MonitoringSummary
+  startup?: {
+    configPassed: boolean
+    completeness: ProjectCompletenessReport
+    planning?: RequirementAnalysis
+  }
   merge: {
     success: boolean
     order: string[]
@@ -563,4 +619,33 @@ export const PARALLEL_REPORT_FILE = '.claude/parallel/report.json'
 export const PARALLEL_CONTRACTS_FILE = '.claude/parallel/contracts.json'
 export const PARALLEL_TELEMETRY_FILE = '.claude/parallel/telemetry.json'
 export const PARALLEL_AUDIT_FILE = '.claude/parallel/audit.json'
+export const PARALLEL_REQUIREMENT_FILE = '.claude/parallel/requirement.json'
 export const PARALLEL_WORKSPACES_DIR = '.claude/parallel/workspaces'
+export const PARALLEL_CONTEXT_DIR = '.claude/parallel/context'
+
+export interface TaskContextSnapshot {
+  mcpId: string
+  taskId: string
+  sessionId: string
+  roleType: string
+  title: string
+  requirement: string
+  patchRequirement?: string
+  status: string
+  output: string
+  files: string[]
+  durationMs: number
+  tokens: number
+  timestamp: string
+  createdAt: string
+}
+
+export interface ContextIndex {
+  mcpId: string
+  taskId: string
+  file: string
+  title: string
+  status: string
+  createdAt: string
+  tokens: number
+}
