@@ -1,4 +1,13 @@
-import type { ExecutionSession, ParallelProgressEvent, ProjectCompletenessReport, ProjectConfigReport, RequirementAnalysis } from '../../types.js'
+import type {
+  ControllerDecision,
+  ControllerPlan,
+  ExecutionSession,
+  McpLaneState,
+  ParallelProgressEvent,
+  ProjectCompletenessReport,
+  ProjectConfigReport,
+  RequirementAnalysis,
+} from '../../types.js'
 import { MetricsAggregator } from '../telemetry/metrics-aggregator.js'
 import { PreflightScanner } from '../preflight/preflight-scanner.js'
 
@@ -48,6 +57,9 @@ function parseJsonArray<T>(raw: string | undefined, fallback: T[]): T[] {
 function defaultPlanningAnalysis(session: ExecutionSession): RequirementAnalysis {
   const landingZones = Array.from(new Set(session.taskGraph.tasks.flatMap(task => task.files).filter(Boolean)))
   const recommendedRoles = Array.from(new Set(session.taskGraph.tasks.map(task => task.roleType)))
+  const estimatedParallelism = Math.max(1, recommendedRoles.length)
+  const recommendedExecutionLaneCount = Math.max(1, recommendedRoles.filter(role => role !== 'controller').length)
+  const recommendedTotalMcpCount = Math.max(2, recommendedExecutionLaneCount + 1)
   return {
     kind: 'feature',
     likelyLandingZones: landingZones.length > 0 ? landingZones : ['src/**'],
@@ -56,7 +68,64 @@ function defaultPlanningAnalysis(session: ExecutionSession): RequirementAnalysis
     clarityHints: [],
     riskLevel: 'medium',
     riskHints: [],
+    estimatedParallelism,
+    recommendedExecutionLaneCount,
+    recommendedTotalMcpCount,
+    laneRoleRecommendations: recommendedRoles.map(roleType => ({
+      roleType,
+      count: roleType === 'controller' ? 1 : Math.max(1, session.taskGraph.tasks.filter(task => task.roleType === roleType).length),
+      reason: 'derived from existing task graph',
+    })),
+    decompositionStrategy: '兼容模式：按现有任务角色恢复 lane',
+    controllerSummary: 'MCP-01 兼容模式恢复 planning 视图。',
+    controllerReasoning: ['planning analysis derived from task graph because explicit controller plan was missing'],
   }
+}
+
+function defaultControllerPlan(session: ExecutionSession): ControllerPlan {
+  const analysis = session.taskGraph.analysis || defaultPlanningAnalysis(session)
+  return {
+    summary: analysis.controllerSummary,
+    estimatedParallelism: analysis.estimatedParallelism,
+    recommendedExecutionLaneCount: analysis.recommendedExecutionLaneCount,
+    recommendedTotalMcpCount: analysis.recommendedTotalMcpCount,
+    decompositionStrategy: analysis.decompositionStrategy,
+    laneRoleRecommendations: analysis.laneRoleRecommendations,
+    reasoning: analysis.controllerReasoning,
+  }
+}
+
+function defaultLaneStates(session: ExecutionSession): McpLaneState[] {
+  return session.mcps.map(mcp => {
+    const assignedTasks = session.taskGraph.tasks.filter(task => task.assignedMcpId === mcp.id)
+    const activeTask = assignedTasks.find(task => task.status === 'running') || assignedTasks.find(task => task.status === 'ready') || assignedTasks[assignedTasks.length - 1]
+    return {
+      mcpId: mcp.id,
+      roleType: mcp.roleType,
+      status: mcp.status,
+      createdAt: session.createdAt,
+      workspaceId: mcp.workspaceId,
+      currentTaskId: activeTask?.id,
+      latestReply: activeTask ? `${activeTask.id}: ${activeTask.status}` : 'idle',
+      currentElapsedMs: 0,
+      currentTokens: 0,
+      cumulativeElapsedMs: 0,
+      cumulativeTokens: 0,
+      completedTaskCount: assignedTasks.filter(task => task.status === 'completed').length,
+      queueDepth: assignedTasks.filter(task => task.status !== 'completed' && task.status !== 'failed').length,
+    }
+  })
+}
+
+function defaultControllerDecisions(session: ExecutionSession): ControllerDecision[] {
+  return [{
+    id: `decision:${session.sessionId}:compat`,
+    timestamp: session.updatedAt,
+    type: 'controller-note',
+    summary: 'controller decisions reconstructed from persisted session state',
+    reason: 'compatibility fallback',
+    mcpId: session.controllerMcpId,
+  }]
 }
 
 export interface DashboardView {
@@ -75,6 +144,9 @@ export interface DashboardView {
     completeness: ProjectCompletenessReport
   }
   planning: RequirementAnalysis
+  controllerPlan: ControllerPlan
+  laneStates: McpLaneState[]
+  controllerDecisions: ControllerDecision[]
   summary: {
     headline: string
     nextAction: string
@@ -155,6 +227,10 @@ export function buildDashboardView(session: ExecutionSession): DashboardView {
   const scanner = new PreflightScanner()
   const config = scanner.scanConfig(session.projectRoot)
   const completeness = scanner.scanCompleteness(session.projectRoot)
+  const planning = session.taskGraph.analysis || defaultPlanningAnalysis(session)
+  const controllerPlan = session.controllerPlan || defaultControllerPlan(session)
+  const laneStates = session.laneStates || defaultLaneStates(session)
+  const controllerDecisions = session.controllerDecisions || defaultControllerDecisions(session)
   const taskCounts = {
     pending: session.taskGraph.tasks.filter(task => task.status === 'pending').length,
     ready: session.taskGraph.tasks.filter(task => task.status === 'ready').length,
@@ -194,7 +270,8 @@ export function buildDashboardView(session: ExecutionSession): DashboardView {
   const blockedTasks = session.taskGraph.tasks
     .filter(task => task.status === 'blocked')
     .map(task => ({ id: task.id, title: task.title, reasons: blockedReasons(session, task) }))
-  const recentChange = recentProgress[recentProgress.length - 1]?.message || `session is currently ${session.phase}`
+  const latestDecision = controllerDecisions[controllerDecisions.length - 1]
+  const recentChange = latestDecision?.summary || recentProgress[recentProgress.length - 1]?.message || `session is currently ${session.phase}`
   const blockers = blockedTasks.map(task => `${task.id}: ${task.reasons.join(', ') || 'blocked'}`).slice(0, 3)
   const assignmentSummary = parseJsonArray<string>(session.artifacts.assignmentSummary, session.mcps.map(mcp => `${mcp.id} [${mcp.roleType}] waiting`))
   const createdRoles = parseJsonArray<Array<{ mcpId: string; file: string; role: string; tasks: string[] }>[number]>(session.artifacts.createdRoles, [])
@@ -225,7 +302,7 @@ export function buildDashboardView(session: ExecutionSession): DashboardView {
               ? '仍有未完成任务，可尝试恢复继续推进。'
               : '当前已无待执行任务，适合查看最终结果。'
   const headline = session.phase === 'planning'
-    ? '当前执行计划已生成，等待审批后启动多 MCP 执行。'
+    ? controllerPlan.summary
     : blockedTasks.length > 0
       ? `当前有 ${blockedTasks.length} 个阻塞任务，需要先处理卡点。`
       : activeTasks.length > 0
@@ -249,14 +326,17 @@ export function buildDashboardView(session: ExecutionSession): DashboardView {
       config,
       completeness,
     },
-    planning: session.taskGraph.analysis || defaultPlanningAnalysis(session),
+    planning,
+    controllerPlan,
+    laneStates,
+    controllerDecisions,
     summary: {
       headline,
       nextAction,
       nextReason,
       blockers,
       recentChange,
-      assignmentHeadline: `已分配 ${assignmentSummary.length} 个 MCP lane`,
+      assignmentHeadline: `主控计划 ${controllerPlan.recommendedExecutionLaneCount} 条执行 lane，实际创建 ${laneStates.filter(lane => lane.roleType !== 'controller').length} 条`,
       roleHeadline: createdRoles.length > 0 ? `已创建 ${createdRoles.length} 个角色文件` : '角色文件待创建',
     },
     governance: session.governance || {

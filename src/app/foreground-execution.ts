@@ -7,7 +7,7 @@ import { buildDashboardView } from '../core/report/dashboard-view.js'
 import { SessionRuntime } from '../core/runtime/session-runtime.js'
 import { Scheduler } from '../core/scheduler/scheduler.js'
 import { createAuditRecord } from '../core/telemetry/audit-trail.js'
-import { renderExecutionSummaryTable, shouldBroadcast, formatTaskProgress, formatMergeProgress, formatBatchDispatch, renderLiveWorkerTable, type WorkerLiveState } from '../core/terminal/ui.js'
+import { renderExecutionSummaryTable, shouldBroadcast, formatTaskProgress, formatMergeProgress, formatBatchDispatch, renderLiveWorkerTable, renderLiveControllerConsole, formatControllerDecision, type WorkerLiveState } from '../core/terminal/ui.js'
 import { WorkspaceManager } from '../core/workspace/workspace-manager.js'
 import { buildContextSummary } from '../core/context/context-summary.js'
 
@@ -86,7 +86,9 @@ export async function runForegroundExecution(options: {
   const progressEvents: ParallelProgressEvent[] = []
   const workerStates = new Map<string, WorkerLiveState>()
   let lastWorkerBroadcast = 0
+  let lastControllerBroadcast = 0
   const WORKER_THROTTLE_MS = 8_000
+  const CONTROLLER_THROTTLE_MS = 2_500
 
   const broadcast = (msg: string) => {
     if (!options.server) return
@@ -96,6 +98,13 @@ export async function runForegroundExecution(options: {
   const broadcastWorkerTable = () => {
     if (workerStates.size === 0) return
     broadcast(renderLiveWorkerTable(workerStates))
+  }
+
+  const broadcastControllerConsole = (session: ExecutionSession, force = false) => {
+    const now = Date.now()
+    if (!force && now - lastControllerBroadcast < CONTROLLER_THROTTLE_MS) return
+    lastControllerBroadcast = now
+    broadcast(renderLiveControllerConsole(session))
   }
 
   const finalSession = await executeSessionPipeline({
@@ -110,6 +119,12 @@ export async function runForegroundExecution(options: {
     mergeFailureFallback: options.mergeFailureFallback,
     onProgress: (event, session) => {
       progressEvents.push(event)
+
+      if (event.kind === 'controller' && session) {
+        broadcast(formatControllerDecision(event))
+        broadcastControllerConsole(session, true)
+        return
+      }
 
       // Track worker states
       if (event.kind === 'worker' && event.mcpId) {
@@ -129,6 +144,7 @@ export async function runForegroundExecution(options: {
             activeModel: event.activeModel || '',
           })
           broadcastWorkerTable()
+          if (session) broadcastControllerConsole(session)
         } else {
           existing.status = status
           if (event.snippet) existing.snippet = event.snippet
@@ -138,12 +154,14 @@ export async function runForegroundExecution(options: {
 
           if (status === 'completed' || status === 'failed') {
             broadcastWorkerTable()
+            if (session) broadcastControllerConsole(session, true)
           } else {
             const now = Date.now()
             if (now - lastWorkerBroadcast >= WORKER_THROTTLE_MS) {
               lastWorkerBroadcast = now
               broadcastWorkerTable()
             }
+            if (session) broadcastControllerConsole(session)
           }
         }
         return
@@ -155,6 +173,7 @@ export async function runForegroundExecution(options: {
         broadcast(formatBatchDispatch([event], session.taskGraph.tasks))
       } else if (event.kind === 'task') {
         broadcast(formatTaskProgress(event))
+        if (session) broadcastControllerConsole(session)
       } else if (event.kind === 'merge' || event.kind === 'recovery') {
         broadcast(formatMergeProgress(event))
       } else {

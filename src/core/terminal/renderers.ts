@@ -182,7 +182,9 @@ export function renderMcpLaneSnapshot(view: DashboardView): string[] {
 }
 
 export function renderProgressEvent(event: ParallelProgressEvent): string {
-  const prefix = event.kind === 'batch'
+  const prefix = event.kind === 'controller'
+    ? '[ctrl]'
+    : event.kind === 'batch'
     ? '[batch]'
     : event.kind === 'task'
       ? '[task]'
@@ -416,8 +418,13 @@ function renderStartupRequirementAnalysis(flow: StartupFlowState): string[] {
   if (!flow.requirementAnalysis) return ['⚠️ requirement captured but analysis is unavailable']
   return [
     `kind: ${flow.requirementAnalysis.kind}`,
+    `controller: ${flow.requirementAnalysis.controllerSummary}`,
     `landing zones: ${joinList(flow.requirementAnalysis.likelyLandingZones)}`,
     `recommended roles: ${joinList(flow.requirementAnalysis.recommendedRoles)}`,
+    `parallelism: ${flow.requirementAnalysis.estimatedParallelism}`,
+    `execution lanes: ${flow.requirementAnalysis.recommendedExecutionLaneCount}`,
+    `total MCPs: ${flow.requirementAnalysis.recommendedTotalMcpCount}`,
+    `decomposition: ${flow.requirementAnalysis.decompositionStrategy}`,
     `clarity: ${flow.requirementAnalysis.clarity}`,
     `clarity hints: ${joinList(flow.requirementAnalysis.clarityHints)}`,
     `risk: ${flow.requirementAnalysis.riskLevel}`,
@@ -429,8 +436,13 @@ function renderPlanningAnalysis(view: DashboardView): string[] {
   const analysis = view.planning
   return [
     `kind: ${analysis.kind}`,
+    `controller: ${analysis.controllerSummary}`,
     `landing zones: ${joinList(analysis.likelyLandingZones)}`,
     `recommended roles: ${joinList(analysis.recommendedRoles)}`,
+    `parallelism: ${analysis.estimatedParallelism}`,
+    `execution lanes: ${analysis.recommendedExecutionLaneCount}`,
+    `total MCPs: ${analysis.recommendedTotalMcpCount}`,
+    `decomposition: ${analysis.decompositionStrategy}`,
     `clarity: ${analysis.clarity}`,
     `clarity hints: ${joinList(analysis.clarityHints)}`,
     `risk: ${analysis.riskLevel}`,
@@ -741,6 +753,9 @@ export function renderExecutionPlan(view: DashboardView): string {
     `recommended roles: ${joinList(a.recommendedRoles)}`,
   ]
 
+  const lanePlanLines = view.controllerPlan.laneRoleRecommendations.map(lane => `${lane.roleType} × ${lane.count} — ${lane.reason}`)
+  const controllerDecisionLines = view.controllerDecisions.slice(-6).map(decision => `${decision.type} | ${decision.summary}${decision.reason ? ` | ${compactText(decision.reason, 40)}` : ''}`)
+
   const sections = [
     box('⚠️  IMPORTANT', [
       'This is a PLAN ONLY. Do NOT start coding or implementing any tasks.',
@@ -753,23 +768,36 @@ export function renderExecutionPlan(view: DashboardView): string {
       ['session', view.sessionId],
       ['phase', labelForPhase(view.phase)],
       ['controller', view.controller],
-      ['mcps', view.mcps.length],
+      ['parallelism', view.controllerPlan.estimatedParallelism],
+      ['execution lanes', view.controllerPlan.recommendedExecutionLaneCount],
+      ['total MCPs', view.controllerPlan.recommendedTotalMcpCount],
+      ['actual lanes', view.laneStates.filter(lane => lane.roleType !== 'controller').length],
       ['tasks', totalTasks],
       ['completeness', view.startup.completeness.status],
     ]),
     '',
     box('📊 Requirement Analysis', analysisLines),
     '',
+    box('🎛️ Controller Plan', [
+      view.controllerPlan.summary,
+      `strategy: ${view.controllerPlan.decompositionStrategy}`,
+      ...view.controllerPlan.reasoning.map(line => `- ${line}`),
+    ]),
+    '',
+    box('🧩 Lane Roster', lanePlanLines.length > 0 ? lanePlanLines : ['- no lane recommendations']),
+    '',
     box('📝 Requirement', [compactText(view.startup.requirement, W - 6)]),
     '',
     taskTable.toString(),
+    '',
+    box('🧠 Controller Decisions', controllerDecisionLines.length > 0 ? controllerDecisionLines : ['- no controller decisions recorded']),
     '',
     box('🔐 Governance', [
       `governance: ${view.governance.status}    contracts: ${view.contracts.length}    reviews: ${view.reviewAssignments.length}`,
     ]),
     '',
     box('✅ Next Step', [
-      '→ Call parallel_approve to create role workspaces and begin multi-MCP execution.',
+      '→ Call parallel_approve to materialize the controller-generated lane roster and begin multi-MCP execution.',
     ]),
   ]
 

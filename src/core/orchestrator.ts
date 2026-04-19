@@ -1,6 +1,8 @@
 import type {
   ContractArtifact,
+  ControllerDecision,
   ExecutionSession,
+  McpLaneState,
   McpMessage,
   McpNode,
   McpNodeStatus,
@@ -94,22 +96,179 @@ export function approvalsFromArtifacts(artifacts: ReviewArtifact[]): ReviewAppro
   }))
 }
 
-export function withTaskRunning(session: ExecutionSession, task: OrchestratedTask): ExecutionSession {
-  const updatedTaskGraph: TaskGraph = {
-    tasks: session.taskGraph.tasks.map(item =>
-      item.id === task.id
-        ? { ...item, status: 'running' }
-        : item
-    ),
-  }
+function nowIso(): string {
+  return new Date().toISOString()
+}
 
+function progressEvent(kind: ParallelProgressEvent['kind'], message: string, partial: Omit<ParallelProgressEvent, 'kind' | 'message' | 'timestamp'> = {}): ParallelProgressEvent {
+  return {
+    kind,
+    message,
+    timestamp: nowIso(),
+    ...partial,
+  }
+}
+
+function progressTelemetry(session: ExecutionSession, event: ParallelProgressEvent): TelemetryEvent {
+  return {
+    id: `evt-${Date.now()}-${event.kind}-${event.taskId || 'session'}`,
+    timestamp: event.timestamp,
+    sessionId: session.sessionId,
+    mcpId: event.mcpId,
+    taskId: event.taskId,
+    type: event.kind === 'worker' ? 'worker.output' : event.kind === 'task' ? 'task.progress' : `${event.kind}.progress`,
+    message: event.message,
+    durationMs: event.durationMs,
+    totalTokens: event.totalTokens,
+    activeModel: event.activeModel,
+    metadata: {
+      ...(event.phase ? { phase: String(event.phase) } : {}),
+      ...(event.status ? { status: event.status } : {}),
+      ...(event.snippet ? { snippet: event.snippet } : {}),
+      ...(event.batchId ? { batchId: event.batchId } : {}),
+    },
+  }
+}
+
+function formatFailedBranches(mergeResult: { failedBranches?: Array<{ branch: string; error?: string }> }): string {
+  return mergeResult.failedBranches?.map(item => `${item.branch}${item.error ? `(${item.error})` : ''}`).join(', ') || 'none'
+}
+
+function mcpMsg(from: string, to: string, type: McpMessage['type'], content: string, extra?: Partial<McpMessage>): McpMessage {
+  return { id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, timestamp: nowIso(), from, to, type, content, ...extra }
+}
+
+function appendMsg(session: ExecutionSession, msg: McpMessage): ExecutionSession {
+  return { ...session, messageLog: [...(session.messageLog || []), msg] }
+}
+
+function buildControllerDecision(
+  session: ExecutionSession,
+  type: ControllerDecision['type'],
+  summary: string,
+  extra: Partial<ControllerDecision> = {}
+): ControllerDecision {
+  return {
+    id: `decision:${session.sessionId}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`,
+    timestamp: nowIso(),
+    type,
+    summary,
+    ...extra,
+  }
+}
+
+function appendControllerDecision(session: ExecutionSession, decision: ControllerDecision): ExecutionSession {
+  return {
+    ...session,
+    controllerDecisions: [...(session.controllerDecisions || []), decision],
+  }
+}
+
+function recalculateLaneStates(session: ExecutionSession): McpLaneState[] {
+  const previous = new Map((session.laneStates || []).map(lane => [lane.mcpId, lane]))
+  return session.mcps.map(mcp => {
+    const assignedTasks = session.taskGraph.tasks.filter(task => task.assignedMcpId === mcp.id)
+    const runningTask = assignedTasks.find(task => task.status === 'running')
+    const readyTask = assignedTasks.find(task => task.status === 'ready' || task.status === 'pending')
+    const latestTask = assignedTasks[assignedTasks.length - 1]
+    const activeTask = runningTask || readyTask || latestTask
+    const prev = previous.get(mcp.id)
+    const latestMessage = [...(session.messageLog || [])]
+      .reverse()
+      .find(item => item.from === mcp.id || item.to === mcp.id)
+
+    return {
+      mcpId: mcp.id,
+      roleType: mcp.roleType,
+      status: mcp.status,
+      createdAt: prev?.createdAt || session.createdAt,
+      workspaceId: mcp.workspaceId,
+      currentTaskId: activeTask?.id,
+      latestReply: latestMessage?.content || prev?.latestReply || (activeTask ? `${activeTask.id}: ${activeTask.status}` : 'idle'),
+      currentElapsedMs: runningTask ? prev?.currentElapsedMs || 0 : 0,
+      currentTokens: runningTask ? prev?.currentTokens || 0 : 0,
+      cumulativeElapsedMs: prev?.cumulativeElapsedMs || 0,
+      cumulativeTokens: prev?.cumulativeTokens || 0,
+      completedTaskCount: assignedTasks.filter(task => task.status === 'completed').length,
+      queueDepth: assignedTasks.filter(task => task.status !== 'completed' && task.status !== 'failed').length,
+    }
+  })
+}
+
+function withLaneSnapshot(session: ExecutionSession): ExecutionSession {
+  return {
+    ...session,
+    laneStates: recalculateLaneStates(session),
+  }
+}
+
+function updateLaneState(
+  session: ExecutionSession,
+  mcpId: string,
+  patch: Partial<McpLaneState> | ((lane: McpLaneState) => McpLaneState)
+): ExecutionSession {
+  const lanes = recalculateLaneStates(session)
+  return {
+    ...session,
+    laneStates: lanes.map(lane => {
+      if (lane.mcpId !== mcpId) return lane
+      return typeof patch === 'function' ? patch(lane) : { ...lane, ...patch }
+    }),
+  }
+}
+
+function buildReadyRoleSummary(session: ExecutionSession): string {
+  const readyTasks = session.taskGraph.tasks.filter(task => task.status === 'ready')
+  if (readyTasks.length === 0) return 'ready=0 blocked=0'
+
+  const byRole = readyTasks.reduce<Record<string, number>>((acc, task) => {
+    acc[task.roleType] = (acc[task.roleType] || 0) + 1
+    return acc
+  }, {})
+  const roleSummary = Object.entries(byRole)
+    .map(([role, count]) => `${role}:${count}`)
+    .join(', ')
+  return `ready=${readyTasks.length} blocked=${session.taskGraph.tasks.filter(task => task.status === 'blocked').length} roles=${roleSummary}`
+}
+
+function buildRunningMcpSummary(session: ExecutionSession): string {
+  const running = session.mcps.filter(mcp => mcp.status === 'running')
+  if (running.length === 0) return 'running-mcps=0'
+  return `running-mcps=${running.length} ${running.map(mcp => mcp.id).join(', ')}`
+}
+
+function dispatchableTasks(session: ExecutionSession, policy: PolicyEngine): OrchestratedTask[] {
+  return session.taskGraph.tasks.filter(task => {
+    if (task.status !== 'ready' || !task.assignedMcpId) return false
+    const node = session.mcps.find(item => item.id === task.assignedMcpId)
+    if (!node) return false
+    return node.status !== 'running'
+      && node.status !== 'failed'
+      && policy.canExecuteTask(node, task, session.controllerMcpId)
+  })
+}
+
+function hasIdleEligibleLane(session: ExecutionSession, policy: PolicyEngine): boolean {
+  return session.mcps.some(node =>
+    node.id !== session.controllerMcpId
+    && node.status !== 'running'
+    && node.status !== 'failed'
+    && session.taskGraph.tasks.some(task => task.status === 'ready' && task.assignedMcpId === node.id && policy.canExecuteTask(node, task, session.controllerMcpId))
+  )
+}
+
+function applyTaskRunning(session: ExecutionSession, task: OrchestratedTask): ExecutionSession {
+  const updatedTaskGraph: TaskGraph = {
+    ...session.taskGraph,
+    tasks: session.taskGraph.tasks.map(item => item.id === task.id ? { ...item, status: 'running' } : item),
+  }
   const updatedMcps: McpNode[] = session.mcps.map(item =>
     item.id === task.assignedMcpId
       ? { ...item, status: 'running' as McpNodeStatus }
       : item
   )
 
-  return {
+  return withLaneSnapshot({
     ...session,
     taskGraph: updatedTaskGraph,
     mcps: updatedMcps,
@@ -117,10 +276,10 @@ export function withTaskRunning(session: ExecutionSession, task: OrchestratedTas
       phase: session.phase,
       taskIds: updatedTaskGraph.tasks.filter(item => item.status !== 'completed').map(item => item.id),
     },
-  }
+  })
 }
 
-export function withTaskStatus(session: ExecutionSession, taskId: string, status: OrchestratedTaskStatus, output: string, failureReason?: string): ExecutionSession {
+function applyTaskStatus(session: ExecutionSession, taskId: string, status: OrchestratedTaskStatus, output: string, failureReason?: string): ExecutionSession {
   const updatedTaskGraph: TaskGraph = {
     ...session.taskGraph,
     tasks: session.taskGraph.tasks.map(item =>
@@ -151,7 +310,7 @@ export function withTaskStatus(session: ExecutionSession, taskId: string, status
 
   const nextPhase: SessionPhase = status === 'failed' ? 'failed' : session.phase
 
-  return {
+  return withLaneSnapshot({
     ...session,
     phase: nextPhase,
     taskGraph: updatedTaskGraph,
@@ -164,17 +323,13 @@ export function withTaskStatus(session: ExecutionSession, taskId: string, status
       phase: nextPhase,
       taskIds: updatedTaskGraph.tasks.filter(item => item.status !== 'completed').map(item => item.id),
     },
-  }
+  })
 }
 
-export function getRunnableTasks(session: ExecutionSession): OrchestratedTask[] {
-  return session.taskGraph.tasks.filter(task => task.status === 'ready' && task.assignedMcpId)
-}
-
-export function missingWorkerTelemetry(sessionId: string, task: OrchestratedTask, mcpId?: string, activeModel?: string): TelemetryEvent {
+function missingWorkerTelemetry(sessionId: string, task: OrchestratedTask, mcpId?: string, activeModel?: string): TelemetryEvent {
   return {
     id: `evt-${Date.now()}-${task.id}`,
-    timestamp: new Date().toISOString(),
+    timestamp: nowIso(),
     sessionId,
     mcpId,
     taskId: task.id,
@@ -201,57 +356,211 @@ function taskAudit(sessionId: string, task: OrchestratedTask, action: string, st
   })
 }
 
-function progressEvent(kind: ParallelProgressEvent['kind'], message: string, partial: Omit<ParallelProgressEvent, 'kind' | 'message' | 'timestamp'> = {}): ParallelProgressEvent {
-  return {
-    kind,
-    message,
-    timestamp: new Date().toISOString(),
-    ...partial,
+async function executeSingleTask(options: {
+  sessionSnapshot: ExecutionSession
+  runningSession: ExecutionSession
+  task: OrchestratedTask
+  workspaces: Record<string, WorkspaceDescriptor>
+  contracts: ContractArtifact[]
+  context: string
+  worker: WorkerRunner
+  runtime: SessionRuntime
+  onProgress?: (event: ParallelProgressEvent, session: ExecutionSession) => void
+}): Promise<{ session: ExecutionSession; shouldContinue: boolean }> {
+  const { sessionSnapshot, task, workspaces, contracts, context, worker, runtime, onProgress } = options
+  let running = options.runningSession
+  const node = sessionSnapshot.mcps.find(item => item.id === task.assignedMcpId)
+  const workspace = (() => {
+    if (task.roleType !== 'reviewer') {
+      return task.assignedMcpId ? workspaces[task.assignedMcpId] : undefined
+    }
+
+    const reviewTarget = sessionSnapshot.taskGraph.tasks.find(item =>
+      item.reviewRequired
+      && item.status === 'completed'
+      && task.dependencies.includes(item.id)
+      && item.assignedMcpId
+    )
+    return reviewTarget?.assignedMcpId ? workspaces[reviewTarget.assignedMcpId] : (task.assignedMcpId ? workspaces[task.assignedMcpId] : undefined)
+  })()
+
+  if (!node || !workspace) {
+    const telemetry = missingWorkerTelemetry(sessionSnapshot.sessionId, task, task.assignedMcpId, node?.activeModel)
+    running = applyTaskStatus(running, task.id, 'failed', '', telemetry.message)
+    running = updateLaneState(running, task.assignedMcpId || 'unknown', lane => ({
+      ...lane,
+      latestReply: telemetry.message,
+      currentElapsedMs: 0,
+      currentTokens: 0,
+    }))
+    running = runtime.appendTelemetry(running, telemetry)
+    onProgress?.(progressEvent('controller', `MCP-01 标记 ${task.id} 失败：缺少 workspace`, {
+      phase: running.phase,
+      taskId: task.id,
+      mcpId: task.assignedMcpId,
+      status: 'failed',
+      snippet: telemetry.message,
+    }), running)
+    return { session: running, shouldContinue: false }
   }
-}
 
-function progressTelemetry(session: ExecutionSession, event: ParallelProgressEvent): TelemetryEvent {
-  return {
-    id: `evt-${Date.now()}-${event.kind}-${event.taskId || 'session'}`,
-    timestamp: event.timestamp,
-    sessionId: session.sessionId,
-    mcpId: event.mcpId,
-    taskId: event.taskId,
-    type: event.kind === 'worker' ? 'worker.output' : event.kind === 'task' ? 'task.progress' : `${event.kind}.progress`,
-    message: event.message,
-    durationMs: event.durationMs,
-    activeModel: event.activeModel,
-    metadata: {
-      ...(event.phase ? { phase: String(event.phase) } : {}),
-      ...(event.status ? { status: event.status } : {}),
-      ...(event.snippet ? { snippet: event.snippet } : {}),
-      ...(event.batchId ? { batchId: event.batchId } : {}),
-    },
+  const result = await worker.run(sessionSnapshot, node, task, workspace, contracts, context, event => {
+    const telemetry = progressTelemetry(sessionSnapshot, event)
+    running = runtime.appendTelemetry(running, telemetry)
+    if (event.status === 'started') {
+      running = appendMsg(running, mcpMsg(task.assignedMcpId || 'unknown', sessionSnapshot.controllerMcpId, 'ack', '收到指令，分析后执行。', { taskId: task.id }))
+      running = updateLaneState(running, task.assignedMcpId || 'unknown', lane => ({
+        ...lane,
+        latestReply: '收到指令，分析后执行。',
+        currentElapsedMs: 0,
+        currentTokens: 0,
+      }))
+    } else {
+      running = updateLaneState(running, task.assignedMcpId || 'unknown', lane => ({
+        ...lane,
+        latestReply: event.snippet || event.message,
+        currentElapsedMs: event.durationMs ?? lane.currentElapsedMs,
+        currentTokens: event.totalTokens ?? lane.currentTokens,
+      }))
+    }
+    onProgress?.(event, running)
+  })
+
+  let nextStatus: OrchestratedTaskStatus = result.success ? 'completed' : 'failed'
+  const assignmentEngine = new AssignmentEngine()
+
+  if (!result.success && (task.reassignmentCount || 0) < 2) {
+    const replacement = assignmentEngine.pickReplacement(task, running.mcps, task.assignedMcpId)
+    if (replacement) {
+      const record: TaskReassignmentRecord = {
+        taskId: task.id,
+        fromMcpId: task.assignedMcpId || 'unknown',
+        toMcpId: replacement.id,
+        reason: result.telemetry.message || 'task failed, auto-reassigned',
+        timestamp: nowIso(),
+      }
+      running = withLaneSnapshot({
+        ...running,
+        reassignmentHistory: [...(running.reassignmentHistory || []), record],
+        taskGraph: {
+          ...running.taskGraph,
+          tasks: running.taskGraph.tasks.map(t => t.id === task.id ? {
+            ...t,
+            status: 'pending' as OrchestratedTaskStatus,
+            assignedMcpId: replacement.id,
+            reassignmentCount: (t.reassignmentCount || 0) + 1,
+            lastFailureReason: result.telemetry.message,
+            previousAssignments: [...(t.previousAssignments || []), task.assignedMcpId || 'unknown'],
+          } : t),
+        },
+        mcps: running.mcps.map(mcp => mcp.id === (task.assignedMcpId || 'unknown') ? { ...mcp, status: 'idle' } : mcp),
+      })
+      running = appendControllerDecision(running, buildControllerDecision(running, 'reassign-task', `MCP-01 将 ${task.id} 从 ${task.assignedMcpId} 转派给 ${replacement.id}`, {
+        taskId: task.id,
+        fromMcpId: task.assignedMcpId,
+        toMcpId: replacement.id,
+        mcpId: replacement.id,
+        reason: result.telemetry.message || 'task failed, auto-reassigned',
+      }))
+      running = runtime.appendAudit(running, [createAuditRecord({
+        sessionId: running.sessionId,
+        scope: 'recovery',
+        action: 'mid-execution-reassign',
+        status: 'passed',
+        actor: running.controllerMcpId,
+        mcpId: replacement.id,
+        taskId: task.id,
+        message: `reassigned ${task.id} from ${task.assignedMcpId} to ${replacement.id}: ${result.telemetry.message || 'failed'}`,
+      })])
+      running = appendMsg(running, mcpMsg(running.controllerMcpId, replacement.id, 'reassign', `${task.id} 从 ${task.assignedMcpId} 转派: ${result.telemetry.message || 'failed'}`, { taskId: task.id }))
+      running = updateLaneState(running, task.assignedMcpId || 'unknown', lane => ({
+        ...lane,
+        latestReply: `转派 ${task.id} 到 ${replacement.id}`,
+        currentTaskId: undefined,
+        currentElapsedMs: 0,
+        currentTokens: 0,
+      }))
+      running = updateLaneState(running, replacement.id, lane => ({
+        ...lane,
+        latestReply: `收到转派任务 ${task.id}`,
+      }))
+      onProgress?.(progressEvent('controller', `MCP-01 检测 ${task.id} 失败，立即转派 ${task.assignedMcpId} → ${replacement.id}`, {
+        phase: running.phase,
+        taskId: task.id,
+        mcpId: replacement.id,
+        status: 'reassigned',
+        snippet: result.telemetry.message,
+      }), running)
+      runtime.save(running)
+      return { session: running, shouldContinue: true }
+    }
   }
+
+  running = applyTaskStatus(running, task.id, nextStatus, result.output, result.success ? undefined : result.telemetry.message)
+  running = runtime.appendTelemetry(running, result.telemetry)
+  running = runtime.appendAudit(running, [
+    taskAudit(running.sessionId, task, 'execute-task', result.success ? 'passed' : 'failed', result.telemetry.message),
+  ])
+
+  const now = new Date()
+  const store = new SessionStore(sessionSnapshot.projectRoot)
+  store.saveTaskContext({
+    mcpId: task.assignedMcpId || 'unknown',
+    taskId: task.id,
+    sessionId: running.sessionId,
+    roleType: task.roleType,
+    title: task.title,
+    requirement: running.requirement,
+    status: nextStatus,
+    output: (result.output || '').slice(0, 4000),
+    files: task.files || [],
+    durationMs: result.telemetry.durationMs || 0,
+    tokens: result.telemetry.totalTokens || 0,
+    timestamp: now.toISOString(),
+    createdAt: now.toISOString().replace('T', ' ').slice(0, 19),
+  })
+
+  const mcpId = task.assignedMcpId || 'unknown'
+  const resultContent = result.success
+    ? `${task.id} 执行完成 | 耗时 ${result.telemetry.durationMs || 0}ms | tokens ${result.telemetry.totalTokens || 0}`
+    : `${task.id} 执行失败: ${(result.telemetry.message || '').slice(0, 200)}`
+  running = appendMsg(running, mcpMsg(mcpId, running.controllerMcpId, 'result', resultContent, {
+    taskId: task.id,
+    durationMs: result.telemetry.durationMs,
+    tokens: result.telemetry.totalTokens,
+  }))
+  running = updateLaneState(running, mcpId, lane => ({
+    ...lane,
+    latestReply: resultContent,
+    currentElapsedMs: 0,
+    currentTokens: 0,
+    cumulativeElapsedMs: lane.cumulativeElapsedMs + (result.telemetry.durationMs || 0),
+    cumulativeTokens: lane.cumulativeTokens + (result.telemetry.totalTokens || 0),
+  }))
+
+  const taskFinished = progressEvent('task', `${task.id} ${nextStatus}`, {
+    phase: running.phase,
+    taskId: task.id,
+    mcpId: task.assignedMcpId,
+    status: nextStatus,
+    durationMs: result.telemetry.durationMs,
+    totalTokens: result.telemetry.totalTokens,
+  })
+  running = runtime.appendTelemetry(running, {
+    ...progressTelemetry(running, taskFinished),
+    type: nextStatus === 'completed' ? 'task.completed' : 'task.failed',
+  })
+  onProgress?.(taskFinished, running)
+
+  running = schedulerReconcilePersist(running, runtime)
+  return { session: running, shouldContinue: nextStatus === 'completed' }
 }
 
-function formatFailedBranches(mergeResult: { failedBranches?: Array<{ branch: string; error?: string }> }): string {
-  return mergeResult.failedBranches?.map(item => `${item.branch}${item.error ? `(${item.error})` : ''}`).join(', ') || 'none'
-}
-
-function buildReadyRoleSummary(session: ExecutionSession): string {
-  const readyTasks = session.taskGraph.tasks.filter(task => task.status === 'ready')
-  if (readyTasks.length === 0) return 'ready=0 blocked=0'
-
-  const byRole = readyTasks.reduce<Record<string, number>>((acc, task) => {
-    acc[task.roleType] = (acc[task.roleType] || 0) + 1
-    return acc
-  }, {})
-  const roleSummary = Object.entries(byRole)
-    .map(([role, count]) => `${role}:${count}`)
-    .join(', ')
-  return `ready=${readyTasks.length} blocked=${session.taskGraph.tasks.filter(task => task.status === 'blocked').length} roles=${roleSummary}`
-}
-
-function buildRunningMcpSummary(session: ExecutionSession): string {
-  const running = session.mcps.filter(mcp => mcp.status === 'running')
-  if (running.length === 0) return 'running-mcps=0'
-  return `running-mcps=${running.length} ${running.map(mcp => mcp.id).join(', ')}`
+function schedulerReconcilePersist(session: ExecutionSession, runtime: SessionRuntime): ExecutionSession {
+  const scheduler = new Scheduler()
+  const reconciled = withLaneSnapshot(scheduler.reconcile(session))
+  runtime.save(reconciled)
+  return reconciled
 }
 
 export function buildMergeSummaryLines(mergeResult: {
@@ -272,14 +581,6 @@ export function buildMergeSummaryLines(mergeResult: {
   ]
 }
 
-function mcpMsg(from: string, to: string, type: McpMessage['type'], content: string, extra?: Partial<McpMessage>): McpMessage {
-  return { id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, timestamp: new Date().toISOString(), from, to, type, content, ...extra }
-}
-
-function appendMsg(session: ExecutionSession, msg: McpMessage): ExecutionSession {
-  return { ...session, messageLog: [...(session.messageLog || []), msg] }
-}
-
 export async function executeSessionPipeline(options: {
   projectRoot: string
   session: ExecutionSession
@@ -298,203 +599,90 @@ export async function executeSessionPipeline(options: {
   const scheduler = new Scheduler()
   const policy = new PolicyEngine()
   const worker = new WorkerRunner()
-  let running = options.session
+  let running = withLaneSnapshot(options.session)
 
   while (true) {
-    running = scheduler.reconcile(running)
-    runtime.save(running)
-    options.onProgress?.(progressEvent('session', `phase=${running.phase} runnable scan`, {
+    running = schedulerReconcilePersist(running, runtime)
+    options.onProgress?.(progressEvent('session', `phase=${running.phase} controller scan`, {
       phase: running.phase,
       status: running.phase,
-      snippet: buildReadyRoleSummary(running),
+      snippet: `${buildReadyRoleSummary(running)} | ${buildRunningMcpSummary(running)}`,
     }), running)
 
-    const runnableTasks = getRunnableTasks(running)
-    if (runnableTasks.length === 0) break
-
-    const dispatchBatch = runnableTasks.filter(task => {
-      const node = running.mcps.find(item => item.id === task.assignedMcpId)
-      if (!node) return false
-      return node.status !== 'running'
-        && node.status !== 'failed'
-        && policy.canExecuteTask(node, task, running.controllerMcpId)
-    })
-
-    if (dispatchBatch.length === 0) break
-
-    const batchId = `batch-${Date.now()}`
-    options.onProgress?.(progressEvent('batch', `dispatching ${dispatchBatch.length} tasks`, {
-      phase: running.phase,
-      batchId,
-      status: 'dispatching',
-      snippet: `${dispatchBatch.map(task => `${task.id}@${task.assignedMcpId || 'none'}`).join(', ')} | ${buildRunningMcpSummary(running)}`,
-    }), running)
-
-    for (const task of dispatchBatch) {
-      running = withTaskRunning(running, task)
-      running = appendMsg(running, mcpMsg(running.controllerMcpId, task.assignedMcpId || 'unknown', 'assign', `${task.id}: ${task.title}`, { taskId: task.id }))
-      const taskStarted = progressEvent('task', `${task.id} started on ${task.assignedMcpId || 'none'}`, {
-        phase: running.phase,
-        taskId: task.id,
-        mcpId: task.assignedMcpId,
-        status: 'running',
-      })
-      running = runtime.appendTelemetry(running, {
-        ...progressTelemetry(running, taskStarted),
-        type: 'task.started',
-      })
-      options.onProgress?.(taskStarted, running)
+    const nextTask = dispatchableTasks(running, policy)[0]
+    if (!nextTask) {
+      if (hasIdleEligibleLane(running, policy)) {
+        continue
+      }
+      break
     }
+
+    const assignedLane = running.mcps.find(item => item.id === nextTask.assignedMcpId)
+    running = appendControllerDecision(running, buildControllerDecision(running, 'assign-task', `MCP-01 将 ${nextTask.id} 派给 ${nextTask.assignedMcpId}`, {
+      taskId: nextTask.id,
+      toMcpId: nextTask.assignedMcpId,
+      mcpId: nextTask.assignedMcpId,
+      reason: `任务角色 ${nextTask.roleType}，主控按 lane 可用性与角色匹配立即派发。`,
+    }))
+    running = appendMsg(running, mcpMsg(running.controllerMcpId, nextTask.assignedMcpId || 'unknown', 'assign', `${nextTask.id}: ${nextTask.title}`, { taskId: nextTask.id }))
+    running = applyTaskRunning(running, nextTask)
+    running = updateLaneState(running, nextTask.assignedMcpId || 'unknown', lane => ({
+      ...lane,
+      currentTaskId: nextTask.id,
+      latestReply: `${nextTask.id}: assigned`,
+      currentElapsedMs: 0,
+      currentTokens: 0,
+    }))
+
+    const controllerDispatch = progressEvent('controller', `MCP-01 派发 ${nextTask.id} → ${nextTask.assignedMcpId}${assignedLane ? ` [${assignedLane.roleType}]` : ''}`, {
+      phase: running.phase,
+      taskId: nextTask.id,
+      mcpId: nextTask.assignedMcpId,
+      status: 'dispatching',
+      snippet: `${nextTask.title} | ${buildReadyRoleSummary(running)}`,
+    })
+    running = runtime.appendTelemetry(running, progressTelemetry(running, controllerDispatch))
+    options.onProgress?.(controllerDispatch, running)
+
+    const taskStarted = progressEvent('task', `${nextTask.id} started on ${nextTask.assignedMcpId || 'none'}`, {
+      phase: running.phase,
+      taskId: nextTask.id,
+      mcpId: nextTask.assignedMcpId,
+      status: 'running',
+    })
+    running = runtime.appendTelemetry(running, {
+      ...progressTelemetry(running, taskStarted),
+      type: 'task.started',
+    })
+    options.onProgress?.(taskStarted, running)
     runtime.save(running)
 
-    const batchSnapshot = running
-    const results = await Promise.all(
-      dispatchBatch.map(async task => {
-        const node = batchSnapshot.mcps.find(item => item.id === task.assignedMcpId)
-        const workspace = (() => {
-          if (task.roleType !== 'reviewer') {
-            return task.assignedMcpId ? options.workspaces[task.assignedMcpId] : undefined
-          }
+    const sessionSnapshot = running
+    const executed = await executeSingleTask({
+      sessionSnapshot,
+      runningSession: running,
+      task: nextTask,
+      workspaces: options.workspaces,
+      contracts: options.contracts,
+      context: options.context,
+      worker,
+      runtime,
+      onProgress: options.onProgress,
+    })
+    running = executed.session
 
-          const reviewTarget = batchSnapshot.taskGraph.tasks.find(item =>
-            item.reviewRequired
-            && item.status === 'completed'
-            && task.dependencies.includes(item.id)
-            && item.assignedMcpId
-          )
-          return reviewTarget?.assignedMcpId ? options.workspaces[reviewTarget.assignedMcpId] : (task.assignedMcpId ? options.workspaces[task.assignedMcpId] : undefined)
-        })()
-        if (!node || !workspace) {
-          return {
-            task,
-            result: {
-              success: false,
-              output: '',
-              telemetry: missingWorkerTelemetry(batchSnapshot.sessionId, task, task.assignedMcpId, node?.activeModel),
-            },
-          }
-        }
-
-        const result = await worker.run(batchSnapshot, node, task, workspace, options.contracts, options.context, event => {
-          const telemetry = progressTelemetry(batchSnapshot, event)
-          running = runtime.appendTelemetry(running, telemetry)
-          if (event.status === 'started') {
-            running = appendMsg(running, mcpMsg(task.assignedMcpId || 'unknown', batchSnapshot.controllerMcpId, 'ack', '收到指令，分析后执行。', { taskId: task.id }))
-          }
-          options.onProgress?.(event, running)
+    if (executed.shouldContinue) {
+      const newlyReady = running.taskGraph.tasks.filter(task => task.status === 'ready').map(task => task.id)
+      if (newlyReady.length > 0) {
+        const unlocked = progressEvent('controller', `MCP-01 发现新解锁任务: ${newlyReady.join(', ')}`, {
+          phase: running.phase,
+          status: 'ready',
+          snippet: buildReadyRoleSummary(running),
         })
-        return { task, result }
-      })
-    )
-
-    const assignmentEngine = new AssignmentEngine()
-    for (const { task, result } of results) {
-      let nextStatus: OrchestratedTaskStatus = result.success ? 'completed' : 'failed'
-
-      // Mid-execution reassignment: if task failed and hasn't exceeded retry limit, try to reassign
-      if (!result.success && (task.reassignmentCount || 0) < 2) {
-        const replacement = assignmentEngine.pickReplacement(task, running.mcps, task.assignedMcpId)
-        if (replacement) {
-          const record: TaskReassignmentRecord = {
-            taskId: task.id,
-            fromMcpId: task.assignedMcpId || 'unknown',
-            toMcpId: replacement.id,
-            reason: result.telemetry.message || 'task failed, auto-reassigned',
-            timestamp: new Date().toISOString(),
-          }
-          running = {
-            ...running,
-            reassignmentHistory: [...(running.reassignmentHistory || []), record],
-            taskGraph: {
-              ...running.taskGraph,
-              tasks: running.taskGraph.tasks.map(t => t.id === task.id ? {
-                ...t,
-                status: 'pending' as OrchestratedTaskStatus,
-                assignedMcpId: replacement.id,
-                reassignmentCount: (t.reassignmentCount || 0) + 1,
-                lastFailureReason: result.telemetry.message,
-                previousAssignments: [...(t.previousAssignments || []), task.assignedMcpId || 'unknown'],
-              } : t),
-            },
-          }
-          running = runtime.appendAudit(running, [createAuditRecord({
-            sessionId: running.sessionId,
-            scope: 'recovery',
-            action: 'mid-execution-reassign',
-            status: 'passed',
-            actor: running.controllerMcpId,
-            mcpId: replacement.id,
-            taskId: task.id,
-            message: `reassigned ${task.id} from ${task.assignedMcpId} to ${replacement.id}: ${result.telemetry.message || 'failed'}`,
-          })])
-          options.onProgress?.(progressEvent('recovery', `${task.id} reassigned: ${task.assignedMcpId} → ${replacement.id}`, {
-            taskId: task.id,
-            mcpId: replacement.id,
-            status: 'reassigned',
-          }), running)
-          running = appendMsg(running, mcpMsg(running.controllerMcpId, replacement.id, 'reassign', `${task.id} 从 ${task.assignedMcpId} 转派: ${result.telemetry.message || 'failed'}`, { taskId: task.id }))
-          runtime.save(running)
-          continue // skip marking as failed — task will re-enter runnable queue
-        }
+        running = runtime.appendTelemetry(running, progressTelemetry(running, unlocked))
+        options.onProgress?.(unlocked, running)
       }
-
-      running = withTaskStatus(running, task.id, nextStatus, result.output, result.success ? undefined : result.telemetry.message)
-      running = runtime.appendTelemetry(running, result.telemetry)
-      running = runtime.appendAudit(running, [
-        taskAudit(running.sessionId, task, options.taskAction, result.success ? 'passed' : 'failed', result.telemetry.message),
-      ])
-
-      // Save context snapshot for completed/failed tasks
-      const now = new Date()
-      const store = new SessionStore(options.projectRoot)
-      store.saveTaskContext({
-        mcpId: task.assignedMcpId || 'unknown',
-        taskId: task.id,
-        sessionId: running.sessionId,
-        roleType: task.roleType,
-        title: task.title,
-        requirement: running.requirement,
-        status: nextStatus,
-        output: (result.output || '').slice(0, 4000),
-        files: task.files || [],
-        durationMs: result.telemetry.durationMs || 0,
-        tokens: result.telemetry.totalTokens || 0,
-        timestamp: now.toISOString(),
-        createdAt: now.toISOString().replace('T', ' ').slice(0, 19),
-      })
-
-      const mcpId = task.assignedMcpId || 'unknown'
-      const resultContent = result.success
-        ? `${task.id} 执行完成 | 耗时 ${result.telemetry.durationMs || 0}ms | tokens ${result.telemetry.totalTokens || 0}`
-        : `${task.id} 执行失败: ${(result.telemetry.message || '').slice(0, 200)}`
-      running = appendMsg(running, mcpMsg(mcpId, running.controllerMcpId, 'result', resultContent, {
-        taskId: task.id,
-        durationMs: result.telemetry.durationMs,
-        tokens: result.telemetry.totalTokens,
-      }))
-
-      const taskFinished = progressEvent('task', `${task.id} ${nextStatus}`, {
-        phase: running.phase,
-        taskId: task.id,
-        mcpId: task.assignedMcpId,
-        status: nextStatus,
-        durationMs: result.telemetry.durationMs,
-      })
-      running = runtime.appendTelemetry(running, {
-        ...progressTelemetry(running, taskFinished),
-        type: nextStatus === 'completed' ? 'task.completed' : 'task.failed',
-      })
-      options.onProgress?.(taskFinished, running)
-      running = scheduler.reconcile(running)
-      runtime.save(running)
     }
-
-    options.onProgress?.(progressEvent('batch', `completed ${dispatchBatch.length} tasks`, {
-      phase: running.phase,
-      batchId,
-      status: 'completed',
-      snippet: dispatchBatch.map(task => task.id).join(', '),
-    }), running)
   }
 
   const reviewArtifacts = parseReviewArtifacts(running.artifacts, running.taskGraph.tasks)
@@ -504,6 +692,7 @@ export async function executeSessionPipeline(options: {
     reviewArtifacts,
     reviewApprovals,
   })
+  running = withLaneSnapshot(running)
 
   const governanceAudit = policy.buildGovernanceAudit(running, running.reviewAssignments || [], reviewApprovals)
   options.onProgress?.(progressEvent('merge', 'running quality gate', {
@@ -574,7 +763,7 @@ export async function executeSessionPipeline(options: {
     })),
   ]
 
-  const finalSession: ExecutionSession = runtime.appendAudit({
+  let finalSession: ExecutionSession = {
     ...running,
     phase: finalPhase,
     qualityGate,
@@ -590,7 +779,13 @@ export async function executeSessionPipeline(options: {
       phase: finalPhase,
       taskIds: running.taskGraph.tasks.filter(task => task.status !== 'completed').map(task => task.id),
     },
-  }, auditRecords)
+  }
+  finalSession = withLaneSnapshot(finalSession)
+  finalSession = appendControllerDecision(finalSession, buildControllerDecision(finalSession, 'controller-note', `MCP-01 完成本轮 session，状态 ${finalPhase}`, {
+    mcpId: finalSession.controllerMcpId,
+    reason: mergeResult.success ? 'merge passed' : mergeResult.error || 'merge failed',
+  }))
+  finalSession = runtime.appendAudit(finalSession, auditRecords)
   runtime.save(finalSession)
   options.onProgress?.(progressEvent('session', `session ${finalPhase}`, {
     phase: finalPhase,

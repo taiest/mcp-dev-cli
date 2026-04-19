@@ -111,15 +111,15 @@ async function startMcpServer() {
 
   server.tool(
     'parallel_start',
-    '根据需求自动拆解任务、分配多个 AI 角色并生成执行计划。注意：此工具只生成计划，不会创建角色或开始执行。计划生成后必须调用 parallel_approve 才能启动开发。',
+    '根据需求自动拆解任务、由 MCP-01 按工作量动态决定多个 AI 角色数量并生成执行计划。注意：此工具只生成计划，不会创建角色或开始执行。计划生成后必须调用 parallel_approve 才能启动开发。',
     {
       requirement: z.string().optional().describe('开发需求描述；留空时优先使用 parallel_requirement 已记录的需求'),
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
-      mcpCount: z.number().int().min(1).max(12).optional().describe('MCP 节点数量，默认 6'),
+      mcpCount: z.number().int().min(1).max(12).optional().describe('可选 MCP 总数上限；留空时由 MCP-01 根据工作量动态决定'),
     },
     async ({ requirement, projectRoot, mcpCount }) => {
       const root = projectRoot || findProjectRoot()
-      const result = await startParallelSession(requirement, root, mcpCount || 6)
+      const result = await startParallelSession(requirement, root, mcpCount)
       return { content: [{ type: 'text' as const, text: result }] }
     }
   )

@@ -2,8 +2,11 @@ import { mkdirSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type {
   ContractArtifact,
+  ControllerDecision,
+  ControllerPlan,
   ExecutionSession,
   GovernancePolicy,
+  McpLaneState,
   ModelPolicy,
   McpNode,
 } from '../types.js'
@@ -61,25 +64,144 @@ function governancePolicy(roleType: McpNode['roleType'], index: number): Governa
   }
 }
 
-function buildDefaultMcps(count: number): McpNode[] {
-  const roles = ['controller', 'analyst', 'architect', 'developer', 'tester', 'reviewer'] as const
-  return Array.from({ length: count }).map((_, index) => ({
-    id: `MCP-${String(index + 1).padStart(2, '0')}`,
-    roleType: roles[index] || 'developer',
-    name: roles[index] || `developer-${index + 1}`,
-    priority: index + 1,
-    permissions: index === 0
-      ? ['assign', 'execute', 'review', 'approve', 'switch-model', 'merge', 'override']
-      : roles[index] === 'reviewer'
-        ? ['execute', 'review', 'approve']
-        : ['execute'],
-    governancePolicy: governancePolicy(roles[index] || 'developer', index),
+function buildControllerPlan(taskGraph: ExecutionSession['taskGraph']): ControllerPlan {
+  const analysis = taskGraph.analysis
+  if (!analysis) {
+    return {
+      summary: 'MCP-01 未获得完整分析结果，回退到最小双 MCP 方案。',
+      estimatedParallelism: 1,
+      recommendedExecutionLaneCount: 1,
+      recommendedTotalMcpCount: 2,
+      decompositionStrategy: '最小主控 + 单执行 lane',
+      laneRoleRecommendations: [{ roleType: 'developer', count: 1, reason: '缺少分析结果时使用默认 developer lane' }],
+      reasoning: ['task graph analysis unavailable, fallback to controller + single execution lane'],
+    }
+  }
+
+  return {
+    summary: analysis.controllerSummary,
+    estimatedParallelism: analysis.estimatedParallelism,
+    recommendedExecutionLaneCount: analysis.recommendedExecutionLaneCount,
+    recommendedTotalMcpCount: analysis.recommendedTotalMcpCount,
+    decompositionStrategy: analysis.decompositionStrategy,
+    laneRoleRecommendations: analysis.laneRoleRecommendations,
+    reasoning: analysis.controllerReasoning,
+  }
+}
+
+function buildDynamicMcps(plan: ControllerPlan, maxMcpCount?: number): McpNode[] {
+  const hardCap = Math.max(2, maxMcpCount || plan.recommendedTotalMcpCount)
+  const controller: McpNode = {
+    id: 'MCP-01',
+    roleType: 'controller',
+    name: 'controller',
+    priority: 1,
+    permissions: ['assign', 'execute', 'review', 'approve', 'switch-model', 'merge', 'override'],
+    governancePolicy: governancePolicy('controller', 0),
     tokenBudget: { softLimit: 20000, hardLimit: 40000 },
-    workspaceId: `ws-${index + 1}`,
+    workspaceId: 'ws-1',
     status: 'idle',
     activeModel: 'sonnet',
     modelPolicy: defaultPolicy(),
+  }
+
+  const lanes: McpNode[] = []
+  let index = 2
+  for (const recommendation of plan.laneRoleRecommendations) {
+    for (let copy = 0; copy < recommendation.count; copy += 1) {
+      if (lanes.length + 1 >= hardCap) break
+      const laneIndex = lanes.filter(item => item.roleType === recommendation.roleType).length + 1
+      lanes.push({
+        id: `MCP-${String(index).padStart(2, '0')}`,
+        roleType: recommendation.roleType,
+        name: laneIndex > 1 ? `${recommendation.roleType}-${laneIndex}` : recommendation.roleType,
+        priority: index,
+        permissions: recommendation.roleType === 'reviewer' ? ['execute', 'review', 'approve'] : ['execute'],
+        governancePolicy: governancePolicy(recommendation.roleType, index - 1),
+        tokenBudget: { softLimit: 20000, hardLimit: 40000 },
+        workspaceId: `ws-${index}`,
+        status: 'idle',
+        activeModel: 'sonnet',
+        modelPolicy: defaultPolicy(),
+      })
+      index += 1
+    }
+  }
+
+  if (lanes.length === 0) {
+    lanes.push({
+      id: 'MCP-02',
+      roleType: 'developer',
+      name: 'developer',
+      priority: 2,
+      permissions: ['execute'],
+      governancePolicy: governancePolicy('developer', 1),
+      tokenBudget: { softLimit: 20000, hardLimit: 40000 },
+      workspaceId: 'ws-2',
+      status: 'idle',
+      activeModel: 'sonnet',
+      modelPolicy: defaultPolicy(),
+    })
+  }
+
+  return [controller, ...lanes]
+}
+
+function buildInitialLaneStates(session: ExecutionSession): McpLaneState[] {
+  return session.mcps.map(mcp => ({
+    mcpId: mcp.id,
+    roleType: mcp.roleType,
+    status: mcp.status,
+    createdAt: session.createdAt,
+    workspaceId: mcp.workspaceId,
+    currentTaskId: session.taskGraph.tasks.find(task => task.assignedMcpId === mcp.id && (task.status === 'ready' || task.status === 'pending'))?.id,
+    latestReply: mcp.roleType === 'controller' ? '主控已完成规划，等待批准执行。' : 'lane created by controller',
+    currentElapsedMs: 0,
+    currentTokens: 0,
+    cumulativeElapsedMs: 0,
+    cumulativeTokens: 0,
+    completedTaskCount: 0,
+    queueDepth: session.taskGraph.tasks.filter(task => task.assignedMcpId === mcp.id).length,
   }))
+}
+
+function buildInitialControllerDecisions(session: ExecutionSession): ControllerDecision[] {
+  const createdLaneDecisions = session.mcps
+    .filter(mcp => mcp.id !== session.controllerMcpId)
+    .map(mcp => ({
+      id: `decision:${session.sessionId}:${mcp.id}:create`,
+      timestamp: session.createdAt,
+      type: 'create-lane' as const,
+      summary: `MCP-01 创建 ${mcp.id} [${mcp.roleType}] lane`,
+      reason: session.controllerPlan?.laneRoleRecommendations.find(item => item.roleType === mcp.roleType)?.reason,
+      mcpId: mcp.id,
+    }))
+
+  const assignmentDecisions = session.taskGraph.tasks
+    .filter(task => task.assignedMcpId)
+    .map(task => ({
+      id: `decision:${session.sessionId}:${task.id}:assign`,
+      timestamp: session.createdAt,
+      type: 'assign-task' as const,
+      summary: `MCP-01 将 ${task.id} 派给 ${task.assignedMcpId}`,
+      reason: `任务角色 ${task.roleType}，主控按 lane 负载与角色匹配结果预分配。`,
+      taskId: task.id,
+      toMcpId: task.assignedMcpId,
+      mcpId: task.assignedMcpId,
+    }))
+
+  return [
+    {
+      id: `decision:${session.sessionId}:plan`,
+      timestamp: session.createdAt,
+      type: 'plan',
+      summary: session.controllerPlan?.summary || 'MCP-01 完成规划。',
+      reason: session.controllerPlan?.reasoning.join(' | '),
+      mcpId: session.controllerMcpId,
+    },
+    ...createdLaneDecisions,
+    ...assignmentDecisions,
+  ]
 }
 
 function buildBootstrapContracts(tasks: Array<{ id: string; roleType: string }>): ContractArtifact[] {
@@ -176,7 +298,7 @@ export function summarizeCreatedRoles(roles: Array<{ mcpId: string; file: string
   return roles.map(role => `${role.mcpId} -> .claude/agents/${role.file} [${role.role}] ${role.tasks.length > 0 ? `${role.tasks.length} tasks` : 'waiting'}`)
 }
 
-export async function startParallelSession(requirementInput: string | undefined, projectRoot: string, mcpCount = 6): Promise<string> {
+export async function startParallelSession(requirementInput: string | undefined, projectRoot: string, mcpCount?: number): Promise<string> {
   const runtime = new SessionRuntime(projectRoot)
   const draft = runtime.loadRequirementDraft()
   const requirement = (requirementInput || draft?.requirement || '').trim()
@@ -203,14 +325,16 @@ export async function startParallelSession(requirementInput: string | undefined,
   const preflight = await new PreflightScanner().scan(projectRoot)
   const scheduler = new Scheduler()
   const policy = new PolicyEngine()
-  const mcps = buildDefaultMcps(mcpCount)
   const taskGraph = new TaskGraphBuilder().build(requirement, projectRoot)
+  const controllerPlan = buildControllerPlan(taskGraph)
+  const mcps = buildDynamicMcps(controllerPlan, mcpCount)
   const contracts = buildBootstrapContracts(taskGraph.tasks)
   const session = runtime.create(requirement, mcps, taskGraph, preflight)
   const stackGate = new StackPolicyEngine().validateRequirement(projectRoot, session.stack, requirement, taskGraph)
   const prepared = attachContractsToTasks({
     ...session,
     contracts,
+    controllerPlan,
   })
   const scheduled = scheduler.schedule(prepared)
   const policyGate = policy.validateSession(scheduled)
@@ -222,6 +346,9 @@ export async function startParallelSession(requirementInput: string | undefined,
       phase: 'failed',
       contracts,
       contractGate,
+      controllerPlan,
+      laneStates: buildInitialLaneStates(scheduled),
+      controllerDecisions: buildInitialControllerDecisions({ ...scheduled, controllerPlan }),
       governanceAudit: policy.buildGovernanceAudit(scheduled, scheduled.reviewAssignments || []),
       artifacts: {
         ...scheduled.artifacts,
@@ -270,10 +397,11 @@ export async function startParallelSession(requirementInput: string | undefined,
     })
   }
 
-  const planned: ExecutionSession = {
+  const planningSessionBase: ExecutionSession = {
     ...scheduled,
     phase: 'planning',
     contracts,
+    controllerPlan,
     contractGate,
     governanceAudit: policy.buildGovernanceAudit(scheduled, scheduled.reviewAssignments || []),
     artifacts: {
@@ -286,6 +414,11 @@ export async function startParallelSession(requirementInput: string | undefined,
       phase: 'planning',
       taskIds: scheduled.taskGraph.tasks.map(task => task.id),
     },
+  }
+  const planned: ExecutionSession = {
+    ...planningSessionBase,
+    laneStates: buildInitialLaneStates(planningSessionBase),
+    controllerDecisions: buildInitialControllerDecisions(planningSessionBase),
   }
   runtime.save(planned)
   runtime.clearRequirementDraft()

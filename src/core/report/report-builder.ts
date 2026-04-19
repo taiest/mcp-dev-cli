@@ -45,6 +45,13 @@ export class ReportBuilder {
           `risk=${session.taskGraph.analysis.riskLevel}`,
         ].join(' | ')
       : 'plan=none'
+    const controllerSummary = session.controllerPlan
+      ? `ctrl-plan: lanes=${session.controllerPlan.recommendedExecutionLaneCount} mcps=${session.controllerPlan.recommendedTotalMcpCount} parallelism=${session.controllerPlan.estimatedParallelism} strategy=${session.controllerPlan.decompositionStrategy}`
+      : 'ctrl-plan=none'
+    const laneSummary = (session.laneStates || []).length > 0
+      ? `lanes=${session.laneStates!.filter(l => l.roleType !== 'controller').map(l => `${l.mcpId}:${l.roleType}[${l.status}]`).join(', ')}`
+      : 'lanes=none'
+    const decisionCount = (session.controllerDecisions || []).length
     const reassignmentSummary = (session.reassignmentHistory || []).length > 0
       ? `reassignments=${session.reassignmentHistory!.map(item => `${item.taskId}:${item.fromMcpId}->${item.toMcpId}`).join(', ')}`
       : 'reassignments=none'
@@ -58,7 +65,7 @@ export class ReportBuilder {
       },
       rows: report.rows.map(row => {
         const relatedBlocked = blockedReasons.filter(reason => session.taskGraph.tasks.some(task => task.assignedMcpId === row.mcpId && reason.startsWith(`${task.id}:`)))
-        const extras = [mergeSummary, monitoringSummary, planningAnalysis, reassignmentSummary, `governance=${report.governanceStatus || 'pending'}`]
+        const extras = [mergeSummary, monitoringSummary, planningAnalysis, controllerSummary, laneSummary, `decisions=${decisionCount}`, reassignmentSummary, `governance=${report.governanceStatus || 'pending'}`]
         if (relatedBlocked.length > 0) {
           extras.unshift(`blocked=${relatedBlocked.join(', ')}`)
         }

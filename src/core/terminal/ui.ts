@@ -1,5 +1,5 @@
 import Table from 'cli-table3'
-import type { ContextIndex, ExecutionSummaryReport, ParallelProgressEvent, TaskContextSnapshot } from '../../types.js'
+import type { ContextIndex, ExecutionSession, ExecutionSummaryReport, ParallelProgressEvent, TaskContextSnapshot } from '../../types.js'
 
 const TABLE_CHARS = {
   'top': '─', 'top-mid': '┬', 'top-left': '┌', 'top-right': '┐',
@@ -100,12 +100,8 @@ export function renderExecutionSummaryTable(report: ExecutionSummaryReport): str
       ? `❌ merge failed: ${report.merge.error}`
       : '⏳ no merge attempted'
   const mergeLines = [mergeStatus]
-  if (report.merge.merged.length > 0) {
-    mergeLines.push(`merged: ${report.merge.merged.join(', ')}`)
-  }
-  if (report.merge.conflicts.length > 0) {
-    mergeLines.push(`conflicts: ${report.merge.conflicts.join(', ')}`)
-  }
+  if (report.merge.merged.length > 0) mergeLines.push(`merged: ${report.merge.merged.join(', ')}`)
+  if (report.merge.conflicts.length > 0) mergeLines.push(`conflicts: ${report.merge.conflicts.join(', ')}`)
 
   return [
     header('✅', 'Parallel Execution Complete'),
@@ -159,13 +155,27 @@ export function formatTaskProgress(event: ParallelProgressEvent): string {
   const mcpId = (event.mcpId || '').padEnd(8)
   const role = event.snippet ? `[${event.snippet}]`.padEnd(12) : ''
   const duration = event.durationMs ? ` │ ${formatDuration(event.durationMs)}` : ''
-  const tokens = ''
+  const tokens = event.totalTokens ? ` │ ${formatTokens(event.totalTokens)}` : ''
   return `${icon} ${mcpId}${role}${event.message}${duration}${tokens}`
 }
 
 export function formatMergeProgress(event: ParallelProgressEvent): string {
   const icon = event.status === 'completed' || event.status === 'passed' ? '✅' : event.status === 'failed' ? '❌' : '🔀'
   return `${icon} ${event.message}`
+}
+
+export function formatControllerDecision(event: ParallelProgressEvent): string {
+  const icon = event.status === 'reassigned'
+    ? '🔀'
+    : event.status === 'failed'
+      ? '❌'
+      : event.status === 'ready'
+        ? '📬'
+        : event.status === 'dispatching'
+          ? '📋'
+          : '🧠'
+  const detail = event.snippet ? ` | ${event.snippet}` : ''
+  return `${icon} ${event.message}${detail}`
 }
 
 // ─── Patch Output ────────────────────────────────────────
@@ -200,9 +210,7 @@ export function renderPatchHeader(options: {
     })
     for (let i = 0; i < options.contexts.length; i++) {
       const ctx = options.contexts[i]
-      const filesSummary = ctx.files.length > 1
-        ? `${ctx.files[0]} +${ctx.files.length - 1}`
-        : ctx.files[0] || 'none'
+      const filesSummary = ctx.files.length > 1 ? `${ctx.files[0]} +${ctx.files.length - 1}` : ctx.files[0] || 'none'
       ctxTable.push([
         String(i + 1),
         `${ctx.mcpId}/${ctx.taskId}`,
@@ -350,5 +358,45 @@ export function renderLiveWorkerTable(workers: Map<string, WorkerLiveState>): st
   return [
     `🔄 Workers: ${running} running, ${done} done, ${failed} failed | tokens: ${totalTokens > 0 ? formatTokens(totalTokens) : '...'}`,
     table.toString(),
+  ].join('\n')
+}
+
+export function renderLiveControllerConsole(session: ExecutionSession): string {
+  const decisions = [...(session.controllerDecisions || [])].slice(-6)
+  const lanes = session.laneStates || []
+
+  const decisionLines = decisions.length > 0
+    ? decisions.map(item => `${item.timestamp.slice(11, 19)} ${item.summary}`.slice(0, W - 6))
+    : ['waiting for controller decisions']
+
+  const decisionBox = box('🧠 Controller Decisions', decisionLines)
+
+  const laneTable = new Table({
+    chars: TABLE_CHARS,
+    head: ['MCP', 'Role', 'Task', 'Status', 'Elapsed', 'Tokens', 'Latest'],
+    colWidths: [10, 12, 10, 10, 10, 10, 26],
+    style: STYLE,
+  })
+
+  for (const lane of lanes) {
+    laneTable.push([
+      lane.mcpId,
+      lane.roleType,
+      lane.currentTaskId || '-',
+      `${statusIcon(lane.status)} ${lane.status.slice(0, 5)}`,
+      lane.currentElapsedMs ? formatDuration(lane.currentElapsedMs) : '-',
+      lane.currentTokens ? formatTokens(lane.currentTokens) : '-',
+      (lane.latestReply || '').slice(0, 22),
+    ])
+  }
+
+  const running = lanes.filter(lane => lane.status === 'running').length
+  const queue = lanes.reduce((sum, lane) => sum + lane.queueDepth, 0)
+  const done = lanes.reduce((sum, lane) => sum + lane.completedTaskCount, 0)
+
+  return [
+    `🧠 Controller: ${running} running lanes | queue ${queue} | completed ${done}`,
+    decisionBox,
+    laneTable.toString(),
   ].join('\n')
 }

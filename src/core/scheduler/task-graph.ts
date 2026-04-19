@@ -1,4 +1,5 @@
 import type {
+  ControllerLaneRecommendation,
   McpRoleType,
   OrchestratedTask,
   RequirementAnalysis,
@@ -295,6 +296,22 @@ export class TaskGraphBuilder {
     const clarityHints = this.buildClarityHints(kind, requirement, seeds, clarity)
     const riskLevel = this.buildRiskLevel(kind, requirement)
     const riskHints = this.buildRiskHints(kind, requirement)
+    const laneRoleRecommendations = this.buildLaneRoleRecommendations(seeds)
+    const estimatedParallelism = this.estimateParallelism(seeds)
+    const recommendedExecutionLaneCount = laneRoleRecommendations.reduce((sum, lane) => sum + lane.count, 0)
+    const recommendedTotalMcpCount = Math.max(2, recommendedExecutionLaneCount + 1)
+    const decompositionStrategy = this.buildDecompositionStrategy(kind, seeds, clarity, riskLevel)
+    const controllerReasoning = this.buildControllerReasoning({
+      kind,
+      clarity,
+      riskLevel,
+      estimatedParallelism,
+      recommendedExecutionLaneCount,
+      recommendedTotalMcpCount,
+      laneRoleRecommendations,
+      seeds,
+    })
+    const controllerSummary = `MCP-01 评估当前需求属于 ${kind}，建议创建 ${recommendedExecutionLaneCount} 个执行 lane（总 MCP ${recommendedTotalMcpCount}），按 ${decompositionStrategy} 推进。`
 
     return {
       kind,
@@ -304,6 +321,13 @@ export class TaskGraphBuilder {
       clarityHints,
       riskLevel,
       riskHints,
+      estimatedParallelism,
+      recommendedExecutionLaneCount,
+      recommendedTotalMcpCount,
+      laneRoleRecommendations,
+      decompositionStrategy,
+      controllerSummary,
+      controllerReasoning,
     }
   }
 
@@ -379,6 +403,83 @@ export class TaskGraphBuilder {
     if (this.isArchitectureHeavy(requirement)) hints.push('cross-module coordination risk is higher than single-file edits')
 
     return hints.length > 0 ? hints : ['standard planning, implementation, validation, and review flow applies']
+  }
+
+  private buildLaneRoleRecommendations(seeds: TaskSeed[]): ControllerLaneRecommendation[] {
+    const grouped = new Map<McpRoleType, { count: number; reasons: Set<string> }>()
+
+    for (const seed of seeds) {
+      const entry = grouped.get(seed.roleType) || { count: 0, reasons: new Set<string>() }
+      entry.count += 1
+      entry.reasons.add(this.laneReasonForSeed(seed))
+      grouped.set(seed.roleType, entry)
+    }
+
+    return Array.from(grouped.entries())
+      .map(([roleType, entry]) => ({
+        roleType,
+        count: roleType === 'reviewer' ? 1 : entry.count,
+        reason: Array.from(entry.reasons).join('；'),
+      }))
+      .sort((left, right) => left.roleType.localeCompare(right.roleType))
+  }
+
+  private laneReasonForSeed(seed: TaskSeed): string {
+    if (seed.roleType === 'analyst') return '前置范围分析与需求澄清要先独立推进'
+    if (seed.roleType === 'architect') return '接口/架构边界需要单独拉出控制面 lane'
+    if (seed.roleType === 'developer') return '实现任务需要持续消费分析/架构结果'
+    if (seed.roleType === 'tester') return '验证 lane 可与实现并行准备并在实现后立即接管'
+    if (seed.roleType === 'reviewer') return '存在 reviewRequired 任务，需要独立复审 lane'
+    return '主控建议保留该角色的独立执行 lane'
+  }
+
+  private estimateParallelism(seeds: TaskSeed[]): number {
+    const zeroDependencyTasks = seeds.filter(seed => seed.dependencies.length === 0).length
+    const roleCount = new Set(seeds.map(seed => seed.roleType)).size
+    return Math.max(1, Math.min(seeds.length, Math.max(zeroDependencyTasks, roleCount)))
+  }
+
+  private buildDecompositionStrategy(
+    kind: RequirementKind,
+    seeds: TaskSeed[],
+    clarity: RequirementClarity,
+    riskLevel: RequirementRisk
+  ): string {
+    if (kind === 'validation') return '单 lane 只读验证'
+    if (kind === 'docs') return '轻量单 lane 文档更新'
+    if (clarity === 'ambiguous') return '先分析澄清，再按角色并行推进'
+    if (riskLevel === 'high') return '前置分析/架构 + 实现/验证分 lane + 独立 review'
+    if (seeds.some(seed => seed.roleType === 'tester') && seeds.some(seed => seed.roleType === 'developer')) {
+      return '验证前置准备，与实现 lane 并行衔接'
+    }
+    return '按角色拆 lane，主控持续派发'
+  }
+
+  private buildControllerReasoning(input: {
+    kind: RequirementKind
+    clarity: RequirementClarity
+    riskLevel: RequirementRisk
+    estimatedParallelism: number
+    recommendedExecutionLaneCount: number
+    recommendedTotalMcpCount: number
+    laneRoleRecommendations: ControllerLaneRecommendation[]
+    seeds: TaskSeed[]
+  }): string[] {
+    const reasons = [
+      `任务图共 ${input.seeds.length} 个任务，预计可同时推进 ${input.estimatedParallelism} 条 lane。`,
+      `当前风险等级 ${input.riskLevel}，因此主控建议总 MCP 数量为 ${input.recommendedTotalMcpCount}（含 MCP-01 主控）。`,
+      `执行 lane 数量定为 ${input.recommendedExecutionLaneCount}，避免固定 6 节点的空转或欠配。`,
+    ]
+
+    if (input.clarity !== 'clear') {
+      reasons.push(`需求清晰度为 ${input.clarity}，需要先投放 analyst/architect lane 再进入开发。`)
+    }
+
+    for (const lane of input.laneRoleRecommendations) {
+      reasons.push(`${lane.roleType} × ${lane.count}: ${lane.reason}`)
+    }
+
+    return reasons
   }
 
   private withOptionalReviewer(seeds: TaskSeed[], includeReviewer: boolean): TaskSeed[] {

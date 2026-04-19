@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs'
-import type { ExecutionSession, WorkspaceDescriptor } from '../../types.js'
+import type { ExecutionSession, McpNodeStatus, SessionPhase, WorkspaceDescriptor } from '../../types.js'
 
 export class ResumeRebuilder {
   rebuild(session: ExecutionSession): ExecutionSession {
@@ -8,10 +8,10 @@ export class ResumeRebuilder {
       .filter(task => task.status !== 'completed')
       .map(task => task.id)
 
-    return {
+    const resumed = {
       ...session,
       updatedAt: new Date().toISOString(),
-      phase: session.phase === 'completed' ? 'completed' : 'running',
+      phase: (session.phase === 'completed' ? 'completed' : 'running') as SessionPhase,
       telemetry: [...session.telemetry],
       contracts: [...session.contracts],
       artifacts: {
@@ -21,18 +21,26 @@ export class ResumeRebuilder {
       },
       mcps: session.mcps.map(mcp => ({
         ...mcp,
-        status: taskIds.some(taskId => session.taskGraph.tasks.some(task => task.id === taskId && task.assignedMcpId === mcp.id))
+        status: (taskIds.some(taskId => session.taskGraph.tasks.some(task => task.id === taskId && task.assignedMcpId === mcp.id))
           ? (workspaceMap.has(mcp.id) ? 'idle' : 'blocked')
-          : 'idle',
+          : 'idle') as McpNodeStatus,
       })),
       taskGraph: {
+        ...session.taskGraph,
         tasks: session.taskGraph.tasks.map(task => ({ ...task })),
       },
+      controllerPlan: session.controllerPlan ? { ...session.controllerPlan, laneRoleRecommendations: [...session.controllerPlan.laneRoleRecommendations], reasoning: [...session.controllerPlan.reasoning] } : session.controllerPlan,
+      laneStates: session.laneStates?.map(lane => ({ ...lane })),
+      controllerDecisions: session.controllerDecisions?.map(decision => ({ ...decision })),
+      reassignmentHistory: session.reassignmentHistory?.map(item => ({ ...item })),
+      messageLog: session.messageLog?.map(item => ({ ...item })),
       resumeCursor: {
-        phase: session.phase === 'completed' ? 'completed' : 'running',
+        phase: (session.phase === 'completed' ? 'completed' : 'running') as SessionPhase,
         taskIds,
       },
     }
+
+    return resumed
   }
 
   private restoreWorkspaceMap(raw: string | undefined): Map<string, WorkspaceDescriptor> {

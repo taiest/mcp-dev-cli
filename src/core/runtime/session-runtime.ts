@@ -1,8 +1,11 @@
 import type {
   AuditRecord,
   ContractArtifact,
+  ControllerDecision,
+  ControllerPlan,
   ExecutionSession,
   ExecutionSummaryReport,
+  McpLaneState,
   McpNode,
   PreflightReport,
   ProjectDiscovery,
@@ -18,6 +21,58 @@ import { detectTechStack, getGitInfo, hasClaudeMd, hasMcpConfig, hasParallelPlat
 import { PreflightScanner } from '../preflight/preflight-scanner.js'
 import { appendAuditRecords, createAuditRecord } from '../telemetry/audit-trail.js'
 import { TaskGraphBuilder } from '../scheduler/task-graph.js'
+
+function fallbackControllerPlan(taskGraph: TaskGraph): ControllerPlan {
+  const analysis = taskGraph.analysis
+  return {
+    summary: analysis?.controllerSummary || 'MCP-01 使用兼容模式恢复控制面。',
+    estimatedParallelism: analysis?.estimatedParallelism || 1,
+    recommendedExecutionLaneCount: analysis?.recommendedExecutionLaneCount || Math.max(1, new Set(taskGraph.tasks.map(task => task.roleType)).size),
+    recommendedTotalMcpCount: analysis?.recommendedTotalMcpCount || Math.max(2, new Set(taskGraph.tasks.map(task => task.roleType)).size + 1),
+    decompositionStrategy: analysis?.decompositionStrategy || '兼容模式：按任务角色恢复 lane',
+    laneRoleRecommendations: analysis?.laneRoleRecommendations || Array.from(new Set(taskGraph.tasks.map(task => task.roleType))).map(roleType => ({
+      roleType,
+      count: Math.max(1, taskGraph.tasks.filter(task => task.roleType === roleType).length),
+      reason: '从现有任务图推导恢复',
+    })),
+    reasoning: analysis?.controllerReasoning || ['session loaded from persisted state without explicit controller plan; derived from task graph'],
+  }
+}
+
+function fallbackLaneStates(session: ExecutionSession): McpLaneState[] {
+  return session.mcps.map(mcp => {
+    const assignedTasks = session.taskGraph.tasks.filter(task => task.assignedMcpId === mcp.id)
+    const latestRunningTask = assignedTasks.find(task => task.status === 'running') || assignedTasks[assignedTasks.length - 1]
+    return {
+      mcpId: mcp.id,
+      roleType: mcp.roleType,
+      status: mcp.status,
+      createdAt: session.createdAt,
+      workspaceId: mcp.workspaceId,
+      currentTaskId: latestRunningTask?.id,
+      latestReply: latestRunningTask ? `${latestRunningTask.id}: ${latestRunningTask.status}` : 'idle',
+      currentElapsedMs: 0,
+      currentTokens: 0,
+      cumulativeElapsedMs: 0,
+      cumulativeTokens: 0,
+      completedTaskCount: assignedTasks.filter(task => task.status === 'completed').length,
+      queueDepth: assignedTasks.filter(task => task.status !== 'completed' && task.status !== 'failed').length,
+    }
+  })
+}
+
+function fallbackControllerDecisions(session: ExecutionSession): ControllerDecision[] {
+  return [
+    {
+      id: `decision:${session.sessionId}:restore`,
+      timestamp: session.updatedAt,
+      type: 'controller-note',
+      summary: 'MCP-01 恢复旧 session 的控制面视图。',
+      reason: 'backward compatibility projection from persisted task graph/session state',
+      mcpId: session.controllerMcpId,
+    },
+  ]
+}
 
 export class SessionRuntime {
   private store: SessionStore
@@ -45,6 +100,30 @@ export class SessionRuntime {
       mcps,
       taskGraph,
       contracts: [],
+      controllerPlan: fallbackControllerPlan(taskGraph),
+      laneStates: mcps.map(mcp => ({
+        mcpId: mcp.id,
+        roleType: mcp.roleType,
+        status: mcp.status,
+        createdAt: now,
+        workspaceId: mcp.workspaceId,
+        currentTaskId: undefined,
+        latestReply: mcp.id === (mcps[0]?.id || 'MCP-01') ? '主控 session 已创建。' : 'lane ready',
+        currentElapsedMs: 0,
+        currentTokens: 0,
+        cumulativeElapsedMs: 0,
+        cumulativeTokens: 0,
+        completedTaskCount: 0,
+        queueDepth: 0,
+      })),
+      controllerDecisions: [{
+        id: `decision:${sessionId}:create`,
+        timestamp: now,
+        type: 'plan',
+        summary: `MCP-01 创建 session，准备规划 ${requirement}`,
+        reason: 'session initialization',
+        mcpId: mcps[0]?.id || 'MCP-01',
+      }],
       preflight,
       auditTrail: [
         createAuditRecord({
@@ -73,15 +152,15 @@ export class SessionRuntime {
     const session = this.store.loadSession()
     if (!session) return null
 
-    const normalized = this.normalizeSessionContracts(session)
-    if (JSON.stringify(normalized.contracts) !== JSON.stringify(session.contracts)) {
+    const normalized = this.normalizeSession(this.normalizeSessionContracts(session))
+    if (JSON.stringify(normalized) !== JSON.stringify(session)) {
       this.store.saveSession(normalized)
     }
     return normalized
   }
 
   save(session: ExecutionSession): void {
-    this.store.saveSession({ ...session, updatedAt: new Date().toISOString() })
+    this.store.saveSession(this.normalizeSession({ ...session, updatedAt: new Date().toISOString() }))
   }
 
   resume(): ExecutionSession | null {
@@ -102,21 +181,21 @@ export class SessionRuntime {
   }
 
   appendTelemetry(session: ExecutionSession, event: TelemetryEvent): ExecutionSession {
-    const updated = {
+    const updated = this.normalizeSession({
       ...session,
       telemetry: [...session.telemetry, event],
       updatedAt: new Date().toISOString(),
-    }
+    })
     this.store.saveSession(updated)
     return updated
   }
 
   appendAudit(session: ExecutionSession, records: AuditRecord[]): ExecutionSession {
-    const updated = {
+    const updated = this.normalizeSession({
       ...session,
       auditTrail: appendAuditRecords(session.auditTrail || [], records),
       updatedAt: new Date().toISOString(),
-    }
+    })
     this.store.saveSession(updated)
     return updated
   }
@@ -373,6 +452,15 @@ export class SessionRuntime {
           validationStatus: contract.validationStatus === 'invalid' ? 'invalid' : 'valid',
         }
       }),
+    }
+  }
+
+  private normalizeSession(session: ExecutionSession): ExecutionSession {
+    return {
+      ...session,
+      controllerPlan: session.controllerPlan || fallbackControllerPlan(session.taskGraph),
+      laneStates: session.laneStates || fallbackLaneStates(session),
+      controllerDecisions: session.controllerDecisions || fallbackControllerDecisions(session),
     }
   }
 }

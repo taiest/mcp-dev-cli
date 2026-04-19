@@ -167,6 +167,7 @@ export type McpRoleType = 'controller' | 'developer' | 'tester' | 'analyst' | 'a
 export type RequirementKind = 'analysis' | 'docs' | 'validation' | 'bugfix' | 'refactor' | 'feature'
 export type RequirementClarity = 'clear' | 'mixed' | 'ambiguous'
 export type RequirementRisk = 'low' | 'medium' | 'high'
+export type ControllerDecisionType = 'plan' | 'create-lane' | 'assign-task' | 'reassign-task' | 'lane-status' | 'controller-note'
 export type McpNodeStatus = 'idle' | 'assigned' | 'running' | 'blocked' | 'failed' | 'completed'
 export type OrchestratedTaskStatus = 'pending' | 'ready' | 'running' | 'blocked' | 'reviewing' | 'completed' | 'failed'
 export type SessionPhase = 'planning' | 'preflight' | 'running' | 'reviewing' | 'merging' | 'completed' | 'failed'
@@ -263,6 +264,50 @@ export interface OrchestratedTask {
   previousAssignments?: string[]
 }
 
+export interface ControllerLaneRecommendation {
+  roleType: McpRoleType
+  count: number
+  reason: string
+}
+
+export interface ControllerPlan {
+  summary: string
+  estimatedParallelism: number
+  recommendedExecutionLaneCount: number
+  recommendedTotalMcpCount: number
+  decompositionStrategy: string
+  laneRoleRecommendations: ControllerLaneRecommendation[]
+  reasoning: string[]
+}
+
+export interface McpLaneState {
+  mcpId: string
+  roleType: McpRoleType
+  status: McpNodeStatus
+  createdAt: string
+  workspaceId: string
+  currentTaskId?: string
+  latestReply?: string
+  currentElapsedMs?: number
+  currentTokens?: number
+  cumulativeElapsedMs: number
+  cumulativeTokens: number
+  completedTaskCount: number
+  queueDepth: number
+}
+
+export interface ControllerDecision {
+  id: string
+  timestamp: string
+  type: ControllerDecisionType
+  summary: string
+  reason?: string
+  mcpId?: string
+  taskId?: string
+  fromMcpId?: string
+  toMcpId?: string
+}
+
 export interface RequirementAnalysis {
   kind: RequirementKind
   likelyLandingZones: string[]
@@ -271,6 +316,13 @@ export interface RequirementAnalysis {
   clarityHints: string[]
   riskLevel: RequirementRisk
   riskHints: string[]
+  estimatedParallelism: number
+  recommendedExecutionLaneCount: number
+  recommendedTotalMcpCount: number
+  laneRoleRecommendations: ControllerLaneRecommendation[]
+  decompositionStrategy: string
+  controllerSummary: string
+  controllerReasoning: string[]
 }
 
 export interface TaskReassignmentRecord {
@@ -456,7 +508,7 @@ export interface TelemetryEvent {
 }
 
 export interface ParallelProgressEvent {
-  kind: 'session' | 'batch' | 'task' | 'worker' | 'merge' | 'recovery'
+  kind: 'session' | 'controller' | 'batch' | 'task' | 'worker' | 'merge' | 'recovery'
   message: string
   phase?: SessionPhase | string
   taskId?: string
@@ -535,6 +587,9 @@ export interface ExecutionSession {
   auditTrail?: AuditRecord[]
   telemetry: TelemetryEvent[]
   artifacts: Record<string, string>
+  controllerPlan?: ControllerPlan
+  laneStates?: McpLaneState[]
+  controllerDecisions?: ControllerDecision[]
   reassignmentHistory?: TaskReassignmentRecord[]
   messageLog?: McpMessage[]
   resumeCursor: {
