@@ -31,6 +31,7 @@ export class TaskGraphBuilder {
     const stack = detectTechStack(projectRoot)
     const kind = this.classifyRequirement(normalized)
     const seeds = this.buildSeeds(kind, requirement, stack.frameworks, preferredRoles)
+    this.ensureMinimumParallelism(seeds, kind, requirement)
     const tasks: OrchestratedTask[] = seeds.map((seed, index) => ({
       id: `task-${index + 1}`,
       title: seed.title,
@@ -328,6 +329,34 @@ export class TaskGraphBuilder {
       decompositionStrategy,
       controllerSummary,
       controllerReasoning,
+    }
+  }
+
+  private ensureMinimumParallelism(seeds: TaskSeed[], kind: RequirementKind, requirement: string): void {
+    if (kind === 'analysis' || kind === 'docs' || kind === 'validation') return
+    if (new Set(seeds.map(s => s.roleType)).size >= 2) return
+    const hasTester = seeds.some(s => s.roleType === 'tester')
+    const hasDeveloper = seeds.some(s => s.roleType === 'developer')
+    if (!hasTester) {
+      const devTaskId = seeds.findIndex(s => s.roleType === 'developer') + 1
+      seeds.push({
+        roleType: 'tester',
+        title: 'Validate implementation',
+        description: `Validate the implementation result for: ${requirement}.`,
+        dependencies: devTaskId > 0 ? [`task-${devTaskId}`] : [],
+        reviewRequired: false,
+        files: [],
+      })
+    }
+    if (!hasDeveloper) {
+      seeds.push({
+        roleType: 'developer',
+        title: 'Implement changes',
+        description: `Implement the required changes for: ${requirement}.`,
+        dependencies: [],
+        reviewRequired: true,
+        files: [],
+      })
     }
   }
 
