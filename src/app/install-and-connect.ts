@@ -68,7 +68,7 @@ export async function installAndConnect(projectRootInput: string): Promise<strin
     '',
     'next steps:',
     '1. 关闭当前 Claude Code 会话（输入 /exit 或关闭终端）',
-    '2. 在项目目录重新打开 Claude Code',
+    `2. 重新访问终端输入 "claude" 回车，然后打开项目地址 ${projectRoot} 回车`,
     '3. 输入 /mcp，选择 mcp-dev-cli 并信任连接',
     '4. 使用 parallel_startup 查看项目状态',
     '5. 使用 parallel_requirement 输入需求，或直接使用 parallel_start 开始规划',
