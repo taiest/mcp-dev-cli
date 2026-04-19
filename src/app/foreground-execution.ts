@@ -7,7 +7,7 @@ import { buildDashboardView } from '../core/report/dashboard-view.js'
 import { SessionRuntime } from '../core/runtime/session-runtime.js'
 import { Scheduler } from '../core/scheduler/scheduler.js'
 import { createAuditRecord } from '../core/telemetry/audit-trail.js'
-import { renderExecutionSummaryTable, shouldBroadcast, formatTaskProgress, formatMergeProgress, formatBatchDispatch } from '../core/terminal/ui.js'
+import { renderExecutionSummaryTable, shouldBroadcast, formatTaskProgress, formatMergeProgress, formatBatchDispatch, renderLiveWorkerTable, type WorkerLiveState } from '../core/terminal/ui.js'
 import { WorkspaceManager } from '../core/workspace/workspace-manager.js'
 import { buildContextSummary } from '../core/context/context-summary.js'
 
@@ -84,9 +84,18 @@ export async function runForegroundExecution(options: {
   runtime.save(running)
 
   const progressEvents: ParallelProgressEvent[] = []
+  const workerStates = new Map<string, WorkerLiveState>()
+  let lastWorkerBroadcast = 0
+  const WORKER_THROTTLE_MS = 8_000
+
   const broadcast = (msg: string) => {
     if (!options.server) return
     options.server.sendLoggingMessage({ level: 'info', logger: 'mcp-dev-cli', data: msg }).catch(() => {})
+  }
+
+  const broadcastWorkerTable = () => {
+    if (workerStates.size === 0) return
+    broadcast(renderLiveWorkerTable(workerStates))
   }
 
   const finalSession = await executeSessionPipeline({
@@ -101,6 +110,45 @@ export async function runForegroundExecution(options: {
     mergeFailureFallback: options.mergeFailureFallback,
     onProgress: (event, session) => {
       progressEvents.push(event)
+
+      // Track worker states
+      if (event.kind === 'worker' && event.mcpId) {
+        const key = event.mcpId
+        const existing = workerStates.get(key)
+        const status = (event.status || 'running') as WorkerLiveState['status']
+
+        if (status === 'started' || !existing) {
+          const task = session?.taskGraph.tasks.find(t => t.assignedMcpId === event.mcpId && (t.status === 'running' || t.id === event.taskId))
+          workerStates.set(key, {
+            mcpId: event.mcpId,
+            taskId: event.taskId || task?.id || '?',
+            roleType: task?.roleType || '?',
+            status,
+            startedAt: Date.now(),
+            snippet: event.snippet || '',
+            activeModel: event.activeModel || '',
+          })
+          broadcastWorkerTable()
+        } else {
+          existing.status = status
+          if (event.snippet) existing.snippet = event.snippet
+          if (event.durationMs) existing.durationMs = event.durationMs
+          if (event.activeModel) existing.activeModel = event.activeModel
+          if (event.totalTokens) existing.totalTokens = event.totalTokens
+
+          if (status === 'completed' || status === 'failed') {
+            broadcastWorkerTable()
+          } else {
+            const now = Date.now()
+            if (now - lastWorkerBroadcast >= WORKER_THROTTLE_MS) {
+              lastWorkerBroadcast = now
+              broadcastWorkerTable()
+            }
+          }
+        }
+        return
+      }
+
       if (!shouldBroadcast(event)) return
 
       if (event.kind === 'batch' && event.message.includes('dispatching') && session) {

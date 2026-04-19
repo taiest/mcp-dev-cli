@@ -301,3 +301,54 @@ export function renderContextDetail(snapshot: TaskContextSnapshot): string {
 }
 
 export { formatDuration, formatTokens, statusIcon, header, kvBlock, box, LINE, W }
+
+// ─── Live Worker Status Table ───────────────────────────
+
+export interface WorkerLiveState {
+  mcpId: string
+  taskId: string
+  roleType: string
+  status: 'started' | 'running' | 'completed' | 'failed'
+  startedAt: number
+  snippet: string
+  activeModel: string
+  durationMs?: number
+  totalTokens?: number
+}
+
+export function renderLiveWorkerTable(workers: Map<string, WorkerLiveState>): string {
+  if (workers.size === 0) return ''
+
+  const now = Date.now()
+  const table = new Table({
+    chars: TABLE_CHARS,
+    head: ['MCP', 'Task', 'Status', 'Duration', 'Tokens', 'Latest'],
+    colWidths: [10, 10, 10, 10, 10, 38],
+    style: STYLE,
+  })
+
+  let totalTokens = 0
+  for (const w of workers.values()) {
+    const elapsed = w.durationMs ?? (now - w.startedAt)
+    const tokens = w.totalTokens ?? 0
+    totalTokens += tokens
+    const icon = w.status === 'completed' ? '✅' : w.status === 'failed' ? '❌' : '🔄'
+    table.push([
+      w.mcpId,
+      w.taskId,
+      `${icon} ${w.status.slice(0, 5)}`,
+      formatDuration(elapsed),
+      tokens > 0 ? formatTokens(tokens) : '...',
+      (w.snippet || '').slice(0, 34),
+    ])
+  }
+
+  const running = [...workers.values()].filter(w => w.status === 'running' || w.status === 'started').length
+  const done = [...workers.values()].filter(w => w.status === 'completed').length
+  const failed = [...workers.values()].filter(w => w.status === 'failed').length
+
+  return [
+    `🔄 Workers: ${running} running, ${done} done, ${failed} failed | tokens: ${totalTokens > 0 ? formatTokens(totalTokens) : '...'}`,
+    table.toString(),
+  ].join('\n')
+}

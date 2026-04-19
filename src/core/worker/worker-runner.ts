@@ -375,6 +375,7 @@ export class WorkerRunner {
         status: 'completed',
         durationMs: Date.now() - started,
         snippet: completionSnippet === lastSnippet ? undefined : completionSnippet,
+        totalTokens: usageTotals.totalTokens,
       })
 
       return {
@@ -398,10 +399,12 @@ export class WorkerRunner {
         },
       }
     } catch (error) {
+      const failTokens = extractUsageTotals(aggregatedStdout).totalTokens
       onProgress?.({
         ...eventBase(node, task, `${node.id} failed ${task.id}: ${(error as Error).message}`),
         status: 'failed',
         durationMs: Date.now() - started,
+        totalTokens: failTokens,
       })
       return {
         success: false,

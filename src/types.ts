@@ -467,6 +467,7 @@ export interface ParallelProgressEvent {
   timestamp: string
   durationMs?: number
   activeModel?: string
+  totalTokens?: number
 }
 
 export interface ReviewApproval {
