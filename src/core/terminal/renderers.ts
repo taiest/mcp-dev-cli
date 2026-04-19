@@ -1,5 +1,6 @@
 import type {
   ExecutionSummaryReport,
+  McpMessage,
   ParallelProgressEvent,
   PreflightReport,
   ProjectCompletenessReport,
@@ -911,5 +912,34 @@ export function renderSessionOutcome(options: {
     lines.push(...renderCompactSection('Next Step', [options.nextStep]))
   }
 
+  return lines.join('\n')
+}
+
+const MSG_ICONS: Record<string, string> = { assign: '📋', ack: '✅', progress: '🔄', result: '📦', reassign: '🔀' }
+const MSG_LABELS: Record<string, string> = { assign: '分配任务', ack: '确认', progress: '进度', result: '结果', reassign: '转派' }
+const MSG_SEP = '────────────────────────────────────────'
+
+export function renderMcpMessages(mcpId: string, messages: McpMessage[]): string {
+  const related = messages.filter(m => m.from === mcpId || m.to === mcpId).sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+  if (related.length === 0) {
+    return [uiHeader('💬', `${mcpId} 对话记录`), '', '  暂无对话记录。'].join('\n')
+  }
+  const lines = [uiHeader('💬', `${mcpId} 对话记录`), '']
+  for (const m of related) {
+    const time = m.timestamp.replace('T', ' ').slice(11, 19)
+    const icon = MSG_ICONS[m.type] || '💬'
+    const label = MSG_LABELS[m.type] || m.type
+    lines.push(`  [${time}] ${m.from} → ${m.to}  ${icon} ${label}`)
+    lines.push(`  ${m.content}`)
+    if (m.durationMs || m.tokens) {
+      const parts: string[] = []
+      if (m.durationMs) parts.push(`耗时 ${m.durationMs}ms`)
+      if (m.tokens) parts.push(`tokens ${m.tokens}`)
+      lines.push(`  ${parts.join(' | ')}`)
+    }
+    lines.push(`  ${MSG_SEP}`)
+    lines.push('')
+  }
+  lines.push(`  共 ${related.length} 条消息`)
   return lines.join('\n')
 }

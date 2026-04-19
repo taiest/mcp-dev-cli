@@ -1,6 +1,7 @@
 import type {
   ContractArtifact,
   ExecutionSession,
+  McpMessage,
   McpNode,
   McpNodeStatus,
   OrchestratedTask,
@@ -271,6 +272,14 @@ export function buildMergeSummaryLines(mergeResult: {
   ]
 }
 
+function mcpMsg(from: string, to: string, type: McpMessage['type'], content: string, extra?: Partial<McpMessage>): McpMessage {
+  return { id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, timestamp: new Date().toISOString(), from, to, type, content, ...extra }
+}
+
+function appendMsg(session: ExecutionSession, msg: McpMessage): ExecutionSession {
+  return { ...session, messageLog: [...(session.messageLog || []), msg] }
+}
+
 export async function executeSessionPipeline(options: {
   projectRoot: string
   session: ExecutionSession
@@ -323,6 +332,7 @@ export async function executeSessionPipeline(options: {
 
     for (const task of dispatchBatch) {
       running = withTaskRunning(running, task)
+      running = appendMsg(running, mcpMsg(running.controllerMcpId, task.assignedMcpId || 'unknown', 'assign', `${task.id}: ${task.title}`, { taskId: task.id }))
       const taskStarted = progressEvent('task', `${task.id} started on ${task.assignedMcpId || 'none'}`, {
         phase: running.phase,
         taskId: task.id,
@@ -368,6 +378,9 @@ export async function executeSessionPipeline(options: {
         const result = await worker.run(batchSnapshot, node, task, workspace, options.contracts, options.context, event => {
           const telemetry = progressTelemetry(batchSnapshot, event)
           running = runtime.appendTelemetry(running, telemetry)
+          if (event.status === 'started') {
+            running = appendMsg(running, mcpMsg(task.assignedMcpId || 'unknown', batchSnapshot.controllerMcpId, 'ack', '收到指令，分析后执行。', { taskId: task.id }))
+          }
           options.onProgress?.(event, running)
         })
         return { task, result }
@@ -419,6 +432,7 @@ export async function executeSessionPipeline(options: {
             mcpId: replacement.id,
             status: 'reassigned',
           }), running)
+          running = appendMsg(running, mcpMsg(running.controllerMcpId, replacement.id, 'reassign', `${task.id} 从 ${task.assignedMcpId} 转派: ${result.telemetry.message || 'failed'}`, { taskId: task.id }))
           runtime.save(running)
           continue // skip marking as failed — task will re-enter runnable queue
         }
@@ -448,6 +462,16 @@ export async function executeSessionPipeline(options: {
         timestamp: now.toISOString(),
         createdAt: now.toISOString().replace('T', ' ').slice(0, 19),
       })
+
+      const mcpId = task.assignedMcpId || 'unknown'
+      const resultContent = result.success
+        ? `${task.id} 执行完成 | 耗时 ${result.telemetry.durationMs || 0}ms | tokens ${result.telemetry.totalTokens || 0}`
+        : `${task.id} 执行失败: ${(result.telemetry.message || '').slice(0, 200)}`
+      running = appendMsg(running, mcpMsg(mcpId, running.controllerMcpId, 'result', resultContent, {
+        taskId: task.id,
+        durationMs: result.telemetry.durationMs,
+        tokens: result.telemetry.totalTokens,
+      }))
 
       const taskFinished = progressEvent('task', `${task.id} ${nextStatus}`, {
         phase: running.phase,

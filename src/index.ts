@@ -16,7 +16,7 @@ import { manageContext } from './app/manage-context.js'
 import { installAndConnect } from './app/install-and-connect.js'
 import { PreflightScanner } from './core/preflight/preflight-scanner.js'
 import { SessionRuntime } from './core/runtime/session-runtime.js'
-import { renderPreflight, renderStartupFlow } from './core/terminal/renderers.js'
+import { renderPreflight, renderStartupFlow, renderMcpMessages } from './core/terminal/renderers.js'
 import { findInstallProjectRoot, findProjectRoot, resolveInstallProjectRoot } from './utils/platform.js'
 
 async function runInstallCommand() {
@@ -238,6 +238,23 @@ async function startMcpServer() {
       const root = projectRoot || findProjectRoot()
       const result = manageContext(root, action, mcpId, taskId, timestamp)
       return { content: [{ type: 'text' as const, text: result }] }
+    }
+  )
+
+  server.tool(
+    'parallel_messages',
+    '查看指定 MCP 角色的完整对话记录。显示谁给它发了什么任务、它怎么回复的、执行结果等，按时间排序。',
+    {
+      mcpId: z.string().min(1).describe('要查看的 MCP 编号，如 "MCP-02"'),
+      projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+    },
+    async ({ mcpId, projectRoot }) => {
+      const root = projectRoot || findProjectRoot()
+      const session = new SessionRuntime(root).load()
+      if (!session) {
+        return { content: [{ type: 'text' as const, text: '当前没有活跃的 session，无法查看对话记录。' }] }
+      }
+      return { content: [{ type: 'text' as const, text: renderMcpMessages(mcpId, session.messageLog || []) }] }
     }
   )
 

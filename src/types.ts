@@ -487,6 +487,18 @@ export interface ReviewArtifact {
   timestamp: string
 }
 
+export interface McpMessage {
+  id: string
+  timestamp: string
+  from: string
+  to: string
+  type: 'assign' | 'ack' | 'progress' | 'result' | 'reassign'
+  content: string
+  taskId?: string
+  durationMs?: number
+  tokens?: number
+}
+
 export interface RecoveryRecord {
   step: string
   status: 'passed' | 'failed'
@@ -524,6 +536,7 @@ export interface ExecutionSession {
   telemetry: TelemetryEvent[]
   artifacts: Record<string, string>
   reassignmentHistory?: TaskReassignmentRecord[]
+  messageLog?: McpMessage[]
   resumeCursor: {
     phase: SessionPhase
     taskIds: string[]
