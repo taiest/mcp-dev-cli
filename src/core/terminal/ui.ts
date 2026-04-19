@@ -122,10 +122,10 @@ export function renderExecutionSummaryTable(report: ExecutionSummaryReport): str
     '',
     box('🔀 Merge Result', mergeLines),
     '',
-    box('🚀 Next Steps', [
-      'parallel_report    查看完整执行报告',
-      'parallel_patch     追加修改或修复 bug',
-      'parallel_context   查看/恢复上下文缓存',
+    box('🤖 主控 MCP-01', [
+      '我是主控 MCP-01，以上是本轮完整执行结果。',
+      '如果需要修改，请在下方对话框输入修改指令或需求，',
+      '由我来重新分配执行。',
     ]),
   ].join('\n')
 }

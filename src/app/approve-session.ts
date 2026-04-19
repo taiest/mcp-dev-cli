@@ -1,10 +1,9 @@
 import { SessionRuntime } from '../core/runtime/session-runtime.js'
 import { WorkspaceManager } from '../core/workspace/workspace-manager.js'
-import { buildDashboardView } from '../core/report/dashboard-view.js'
 import { createAuditRecord } from '../core/telemetry/audit-trail.js'
-import { createAgentFiles, summarizeAssignments, summarizeCreatedRoles } from './start-parallel-session.js'
+import { createAgentFiles, summarizeAssignments } from './start-parallel-session.js'
 import { runForegroundExecution } from './foreground-execution.js'
-import { renderExecutionPlan, renderSessionOutcome } from '../core/terminal/renderers.js'
+import { renderSessionOutcome } from '../core/terminal/renderers.js'
 import type { ExecutionSession } from '../types.js'
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 
@@ -74,7 +73,6 @@ export async function approveSession(projectRoot: string, server?: Server): Prom
     })
   }
 
-  const plannedView = buildDashboardView(session)
   const workspaceManager = new WorkspaceManager(projectRoot)
   const workspaces = await workspaceManager.prepare(session)
   const running = withPreparedExecution(runtime, session, workspaces)
@@ -104,12 +102,5 @@ export async function approveSession(projectRoot: string, server?: Server): Prom
     server,
   })
 
-  return [
-    renderExecutionPlan(plannedView),
-    '',
-    'Created Roles',
-    ...summarizeCreatedRoles(createdRoles),
-    '',
-    execution.output,
-  ].join('\n')
+  return execution.output
 }
