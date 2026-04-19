@@ -26,11 +26,56 @@ export async function uninstallProject(projectRoot: string): Promise<string> {
     }
   }
 
+  // Clean settings.local.json
+  const settingsPath = join(projectRoot, '.claude', 'settings.local.json')
+  if (existsSync(settingsPath)) {
+    try {
+      const settings = JSON.parse(readFileSync(settingsPath, 'utf-8'))
+      let changed = false
+      if (Array.isArray(settings.enabledMcpjsonServers)) {
+        settings.enabledMcpjsonServers = settings.enabledMcpjsonServers.filter((s: string) => s !== 'mcp-dev-cli')
+        if (settings.enabledMcpjsonServers.length === 0) delete settings.enabledMcpjsonServers
+        changed = true
+      }
+      if (changed) {
+        writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n')
+        removed.push('.claude/settings.local.json (cleaned)')
+      }
+    } catch { /* ignore */ }
+  }
+
+  // Clean CLAUDE.md — remove injected parallel workflow rules
+  const claudeMdPath = join(projectRoot, 'CLAUDE.md')
+  if (existsSync(claudeMdPath)) {
+    const content = readFileSync(claudeMdPath, 'utf-8')
+    if (content.includes('MCP 多角色并行开发流程') || content.includes('MCP 协同开发规范')) {
+      const cleaned = content
+        .replace(/\n*## MCP 多角色并行开发流程（必须遵守）[\s\S]*?(?=\n## (?!MCP 协同)|$)/, '')
+        .replace(/\n*## MCP 协同开发规范[\s\S]*?(?=\n## (?!角色|断点|接口|Git)|$)/, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim()
+      if (cleaned.length < 20) {
+        rmSync(claudeMdPath)
+        removed.push('CLAUDE.md (deleted)')
+      } else {
+        writeFileSync(claudeMdPath, cleaned + '\n')
+        removed.push('CLAUDE.md (mcp rules removed)')
+      }
+    }
+  }
+
   // Remove .claude/parallel/
   const parallelDir = join(projectRoot, PARALLEL_DIR)
   if (existsSync(parallelDir)) {
     rmSync(parallelDir, { recursive: true })
     removed.push(PARALLEL_DIR)
+  }
+
+  // Remove .claude/agents/
+  const agentsDir = join(projectRoot, '.claude', 'agents')
+  if (existsSync(agentsDir)) {
+    rmSync(agentsDir, { recursive: true })
+    removed.push('.claude/agents')
   }
 
   if (removed.length === 0) {
