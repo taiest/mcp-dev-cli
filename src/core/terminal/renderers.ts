@@ -302,6 +302,7 @@ export function renderStartupFlow(flow: StartupFlowState): string {
 
   const sections = [
     uiHeader('🚀', 'Parallel Controller — Startup'),
+    '  欢迎使用 MCP 多角色并行开发助手，提高开发效率就选我！',
     '',
     statusTable.toString(),
     '',
