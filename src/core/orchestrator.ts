@@ -17,6 +17,7 @@ import type {
   TelemetryEvent,
   WorkspaceDescriptor,
 } from '../types.js'
+import { DEFAULT_CONFIG } from '../types.js'
 import { SessionRuntime } from './runtime/session-runtime.js'
 import { SessionStore } from './runtime/session-store.js'
 import { Scheduler } from './scheduler/scheduler.js'
@@ -593,6 +594,7 @@ export async function executeSessionPipeline(options: {
   mergeFailureFallback: string
   includeGovernanceAuditRecord?: boolean
   includeMergeMetadata?: boolean
+  maxConcurrency?: number
   onProgress?: (event: ParallelProgressEvent, session: ExecutionSession) => void
 }): Promise<ExecutionSession> {
   const runtime = new SessionRuntime(options.projectRoot)
@@ -600,90 +602,153 @@ export async function executeSessionPipeline(options: {
   const policy = new PolicyEngine()
   const worker = new WorkerRunner()
   let running = withLaneSnapshot(options.session)
+  const MAX_CONCURRENCY = options.maxConcurrency ?? DEFAULT_CONFIG.maxConcurrency
 
-  while (true) {
-    running = schedulerReconcilePersist(running, runtime)
-    options.onProgress?.(progressEvent('session', `phase=${running.phase} controller scan`, {
-      phase: running.phase,
-      status: running.phase,
-      snippet: `${buildReadyRoleSummary(running)} | ${buildRunningMcpSummary(running)}`,
-    }), running)
+  // Shared mutable ref so parallel onProgress callbacks all update the same session
+  const shared = { running }
 
-    const nextTask = dispatchableTasks(running, policy)[0]
-    if (!nextTask) {
-      if (hasIdleEligibleLane(running, policy)) {
-        continue
-      }
-      break
-    }
-
-    const assignedLane = running.mcps.find(item => item.id === nextTask.assignedMcpId)
-    running = appendControllerDecision(running, buildControllerDecision(running, 'assign-task', `MCP-01 将 ${nextTask.id} 派给 ${nextTask.assignedMcpId}`, {
-      taskId: nextTask.id,
-      toMcpId: nextTask.assignedMcpId,
-      mcpId: nextTask.assignedMcpId,
-      reason: `任务角色 ${nextTask.roleType}，主控按 lane 可用性与角色匹配立即派发。`,
+  function dispatchTask(task: OrchestratedTask) {
+    const assignedLane = shared.running.mcps.find(item => item.id === task.assignedMcpId)
+    shared.running = appendControllerDecision(shared.running, buildControllerDecision(shared.running, 'assign-task', `MCP-01 将 ${task.id} 派给 ${task.assignedMcpId}`, {
+      taskId: task.id,
+      toMcpId: task.assignedMcpId,
+      mcpId: task.assignedMcpId,
+      reason: `任务角色 ${task.roleType}，主控按 lane 可用性与角色匹配立即派发。`,
     }))
-    running = appendMsg(running, mcpMsg(running.controllerMcpId, nextTask.assignedMcpId || 'unknown', 'assign', `${nextTask.id}: ${nextTask.title}`, { taskId: nextTask.id }))
-    running = applyTaskRunning(running, nextTask)
-    running = updateLaneState(running, nextTask.assignedMcpId || 'unknown', lane => ({
+    shared.running = appendMsg(shared.running, mcpMsg(shared.running.controllerMcpId, task.assignedMcpId || 'unknown', 'assign', `${task.id}: ${task.title}`, { taskId: task.id }))
+    shared.running = applyTaskRunning(shared.running, task)
+    shared.running = updateLaneState(shared.running, task.assignedMcpId || 'unknown', lane => ({
       ...lane,
-      currentTaskId: nextTask.id,
-      latestReply: `${nextTask.id}: assigned`,
+      currentTaskId: task.id,
+      latestReply: `${task.id}: assigned`,
       currentElapsedMs: 0,
       currentTokens: 0,
     }))
 
-    const controllerDispatch = progressEvent('controller', `MCP-01 派发 ${nextTask.id} → ${nextTask.assignedMcpId}${assignedLane ? ` [${assignedLane.roleType}]` : ''}`, {
-      phase: running.phase,
-      taskId: nextTask.id,
-      mcpId: nextTask.assignedMcpId,
+    const controllerDispatch = progressEvent('controller', `MCP-01 派发 ${task.id} → ${task.assignedMcpId}${assignedLane ? ` [${assignedLane.roleType}]` : ''}`, {
+      phase: shared.running.phase,
+      taskId: task.id,
+      mcpId: task.assignedMcpId,
       status: 'dispatching',
-      snippet: `${nextTask.title} | ${buildReadyRoleSummary(running)}`,
+      snippet: `${task.title} | ${buildReadyRoleSummary(shared.running)}`,
     })
-    running = runtime.appendTelemetry(running, progressTelemetry(running, controllerDispatch))
-    options.onProgress?.(controllerDispatch, running)
+    shared.running = runtime.appendTelemetry(shared.running, progressTelemetry(shared.running, controllerDispatch))
+    options.onProgress?.(controllerDispatch, shared.running)
 
-    const taskStarted = progressEvent('task', `${nextTask.id} started on ${nextTask.assignedMcpId || 'none'}`, {
-      phase: running.phase,
-      taskId: nextTask.id,
-      mcpId: nextTask.assignedMcpId,
+    const taskStarted = progressEvent('task', `${task.id} started on ${task.assignedMcpId || 'none'}`, {
+      phase: shared.running.phase,
+      taskId: task.id,
+      mcpId: task.assignedMcpId,
       status: 'running',
     })
-    running = runtime.appendTelemetry(running, {
-      ...progressTelemetry(running, taskStarted),
+    shared.running = runtime.appendTelemetry(shared.running, {
+      ...progressTelemetry(shared.running, taskStarted),
       type: 'task.started',
     })
-    options.onProgress?.(taskStarted, running)
-    runtime.save(running)
+    options.onProgress?.(taskStarted, shared.running)
+    runtime.save(shared.running)
 
-    const sessionSnapshot = running
-    const executed = await executeSingleTask({
-      sessionSnapshot,
-      runningSession: running,
-      task: nextTask,
+    const snapshot = shared.running
+    return executeSingleTask({
+      sessionSnapshot: snapshot,
+      runningSession: shared.running,
+      task,
       workspaces: options.workspaces,
       contracts: options.contracts,
       context: options.context,
       worker,
       runtime,
-      onProgress: options.onProgress,
+      onProgress: (event, _session) => {
+        // Merge worker progress into shared state (JS single-threaded, safe)
+        options.onProgress?.(event, shared.running)
+      },
     })
-    running = executed.session
+  }
 
-    if (executed.shouldContinue) {
-      const newlyReady = running.taskGraph.tasks.filter(task => task.status === 'ready').map(task => task.id)
+  const inFlight = new Map<string, Promise<{ taskId: string; result: { session: ExecutionSession; shouldContinue: boolean } }>>()
+
+  while (true) {
+    shared.running = schedulerReconcilePersist(shared.running, runtime)
+    options.onProgress?.(progressEvent('session', `phase=${shared.running.phase} controller scan`, {
+      phase: shared.running.phase,
+      status: shared.running.phase,
+      snippet: `${buildReadyRoleSummary(shared.running)} | ${buildRunningMcpSummary(shared.running)}`,
+    }), shared.running)
+
+    // Fill up to MAX_CONCURRENCY
+    const available = dispatchableTasks(shared.running, policy)
+    const slots = MAX_CONCURRENCY - inFlight.size
+    const batch = available.slice(0, slots)
+
+    for (const task of batch) {
+      const promise = dispatchTask(task).then(result => ({ taskId: task.id, result }))
+      inFlight.set(task.id, promise)
+    }
+
+    if (inFlight.size === 0) {
+      if (hasIdleEligibleLane(shared.running, policy)) continue
+      break
+    }
+
+    // Wait for any one task to complete
+    const { taskId, result } = await Promise.race(inFlight.values())
+    inFlight.delete(taskId)
+
+    // Merge completed task's state changes into shared.running
+    const completedTask = result.session.taskGraph.tasks.find(t => t.id === taskId)
+    if (completedTask) {
+      // Only propagate 'failed' phase when no tasks are still in flight
+      const mergedPhase = result.session.phase === 'failed' && inFlight.size > 0
+        ? shared.running.phase
+        : result.session.phase
+      shared.running = {
+        ...shared.running,
+        phase: mergedPhase,
+        taskGraph: {
+          ...shared.running.taskGraph,
+          tasks: shared.running.taskGraph.tasks.map(t => t.id === taskId ? completedTask : t),
+        },
+        mcps: shared.running.mcps.map(mcp => {
+          const updated = result.session.mcps.find(m => m.id === mcp.id && m.id === completedTask.assignedMcpId)
+          return updated || mcp
+        }),
+        artifacts: { ...shared.running.artifacts, ...Object.fromEntries(Object.entries(result.session.artifacts).filter(([k]) => k.includes(taskId))) },
+        telemetry: [...shared.running.telemetry, ...result.session.telemetry.slice(shared.running.telemetry.length)],
+        auditTrail: [...(shared.running.auditTrail || []), ...(result.session.auditTrail || []).slice((shared.running.auditTrail || []).length)],
+        messageLog: [...(shared.running.messageLog || []), ...(result.session.messageLog || []).slice((shared.running.messageLog || []).length)],
+        laneStates: shared.running.laneStates?.map(lane => {
+          const updated = result.session.laneStates?.find(l => l.mcpId === lane.mcpId && l.mcpId === completedTask.assignedMcpId)
+          return updated || lane
+        }),
+        reassignmentHistory: [...(shared.running.reassignmentHistory || []), ...(result.session.reassignmentHistory || []).slice((shared.running.reassignmentHistory || []).length)],
+        controllerDecisions: [...(shared.running.controllerDecisions || []), ...(result.session.controllerDecisions || []).slice((shared.running.controllerDecisions || []).length)],
+        resumeCursor: {
+          phase: shared.running.phase,
+          taskIds: shared.running.taskGraph.tasks.filter(t => {
+            const effective = t.id === taskId ? completedTask : t
+            return effective.status !== 'completed'
+          }).map(t => t.id),
+        },
+      }
+      shared.running = withLaneSnapshot(shared.running)
+    }
+
+    if (result.shouldContinue) {
+      shared.running = schedulerReconcilePersist(shared.running, runtime)
+      const newlyReady = shared.running.taskGraph.tasks.filter(task => task.status === 'ready').map(task => task.id)
       if (newlyReady.length > 0) {
         const unlocked = progressEvent('controller', `MCP-01 发现新解锁任务: ${newlyReady.join(', ')}`, {
-          phase: running.phase,
+          phase: shared.running.phase,
           status: 'ready',
-          snippet: buildReadyRoleSummary(running),
+          snippet: buildReadyRoleSummary(shared.running),
         })
-        running = runtime.appendTelemetry(running, progressTelemetry(running, unlocked))
-        options.onProgress?.(unlocked, running)
+        shared.running = runtime.appendTelemetry(shared.running, progressTelemetry(shared.running, unlocked))
+        options.onProgress?.(unlocked, shared.running)
       }
     }
   }
+
+  running = shared.running
 
   const reviewArtifacts = parseReviewArtifacts(running.artifacts, running.taskGraph.tasks)
   const reviewApprovals = approvalsFromArtifacts(reviewArtifacts)

@@ -59,70 +59,32 @@ function statusIcon(status: string): string {
 // ─── Execution Summary Table ─────────────────────────────
 
 export function renderExecutionSummaryTable(report: ExecutionSummaryReport): string {
-  const table = new Table({
-    chars: TABLE_CHARS,
-    head: ['MCP', 'Role', 'Task', 'Status', 'Duration', 'Tokens'],
-    colWidths: [10, 11, 34, 10, 11, 10],
-    style: STYLE,
+  const rows = report.rows.map(row => {
+    const status = row.progressStatus.includes('completed') ? '✅'
+      : row.progressStatus.includes('failed') ? '❌'
+      : '⏳'
+    return `${status} ${row.mcpId} ${row.roleName} | ${row.workContent.split('|')[0].trim().slice(0, 35)} | ${formatDuration(row.durationMs)} ${formatTokens(row.totalTokens)}t`
   })
-
-  for (const row of report.rows) {
-    const status = row.progressStatus.includes('completed') ? '✅ done'
-      : row.progressStatus.includes('failed') ? '❌ fail'
-      : row.progressStatus
-    table.push([
-      row.mcpId,
-      row.roleName,
-      row.workContent.split('|')[0].trim().slice(0, 30),
-      status,
-      formatDuration(row.durationMs),
-      formatTokens(row.totalTokens),
-    ])
-  }
-
-  const totalTable = new Table({
-    chars: { ...TABLE_CHARS, 'top-left': '├', 'top-right': '┤' },
-    colWidths: [10, 11, 34, 10, 11, 10],
-    style: STYLE,
-  })
-  totalTable.push([
-    'TOTAL',
-    '',
-    `${report.completedCount + report.failedCount} tasks`,
-    `${report.completedCount}/${report.completedCount + report.failedCount} ✅`,
-    formatDuration(report.totalDurationMs),
-    formatTokens(report.totalTokens),
-  ])
 
   const mergeStatus = report.merge.success
-    ? `✅ ${report.merge.merged.length} branches merged into main`
+    ? `✅ ${report.merge.merged.length} branches merged`
     : report.merge.error
       ? `❌ merge failed: ${report.merge.error}`
       : '⏳ no merge attempted'
-  const mergeLines = [mergeStatus]
-  if (report.merge.merged.length > 0) mergeLines.push(`merged: ${report.merge.merged.join(', ')}`)
-  if (report.merge.conflicts.length > 0) mergeLines.push(`conflicts: ${report.merge.conflicts.join(', ')}`)
+  const mergeExtra: string[] = []
+  if (report.merge.merged.length > 0) mergeExtra.push(`merged: ${report.merge.merged.join(', ')}`)
+  if (report.merge.conflicts.length > 0) mergeExtra.push(`conflicts: ${report.merge.conflicts.join(', ')}`)
 
   return [
-    header('✅', 'Parallel Execution Complete'),
+    '✅ Parallel Execution Complete',
     '',
-    kvBlock([
-      ['session', report.sessionId],
-      ['duration', formatDuration(report.totalDurationMs)],
-      ['tokens', formatTokens(report.totalTokens)],
-      ['tasks', `${report.completedCount}/${report.completedCount + report.failedCount} completed`],
-    ]),
+    `session: ${report.sessionId}`,
+    `duration: ${formatDuration(report.totalDurationMs)} | tokens: ${formatTokens(report.totalTokens)} | tasks: ${report.completedCount}/${report.completedCount + report.failedCount}`,
     '',
-    table.toString(),
-    totalTable.toString(),
+    ...rows,
     '',
-    box('🔀 Merge Result', mergeLines),
-    '',
-    box('🤖 主控 MCP-01', [
-      '我是主控 MCP-01，以上是本轮完整执行结果。',
-      '如果需要修改，请在下方对话框输入修改指令或需求，',
-      '由我来重新分配执行。',
-    ]),
+    `merge: ${mergeStatus}`,
+    ...mergeExtra,
   ].join('\n')
 }
 
@@ -190,38 +152,21 @@ export function renderPatchHeader(options: {
   contexts: TaskContextSnapshot[]
 }): string {
   const lines = [
-    header('🔧', 'Parallel Patch'),
-    '',
-    kvBlock([
-      ['session', `${options.sessionId} (reopened)`],
-      ['patch', options.requirement.slice(0, 60)],
-      ['target', `${options.targetMcpId} [${options.targetRole}] ← owner of ${options.originalTaskId}`],
-      ['new task', `${options.newTaskId} (appended to task graph)`],
-    ]),
-    '',
+    '🔧 Parallel Patch',
+    '━'.repeat(52),
+    `session: ${options.sessionId} (reopened)`,
+    `patch: ${options.requirement.slice(0, 55)}`,
+    `target: ${options.targetMcpId} [${options.targetRole}] ← ${options.originalTaskId}`,
+    `new task: ${options.newTaskId}`,
   ]
 
   if (options.contexts.length > 0) {
-    const ctxTable = new Table({
-      chars: TABLE_CHARS,
-      head: ['#', 'MCP / Task', 'Time', 'Title', 'Files'],
-      colWidths: [5, 18, 18, 30, 19],
-      style: STYLE,
-    })
+    lines.push('', '📂 Loaded Context:')
     for (let i = 0; i < options.contexts.length; i++) {
       const ctx = options.contexts[i]
-      const filesSummary = ctx.files.length > 1 ? `${ctx.files[0]} +${ctx.files.length - 1}` : ctx.files[0] || 'none'
-      ctxTable.push([
-        String(i + 1),
-        `${ctx.mcpId}/${ctx.taskId}`,
-        ctx.createdAt,
-        ctx.title.slice(0, 28),
-        filesSummary.slice(0, 17),
-      ])
+      const files = ctx.files.length > 1 ? `${ctx.files[0]} +${ctx.files.length - 1}` : ctx.files[0] || 'none'
+      lines.push(`  ${i + 1}. ${ctx.mcpId}/${ctx.taskId} ${ctx.title.slice(0, 25)} [${files}]`)
     }
-    lines.push('  📂 Loaded Context from Cache')
-    lines.push(ctxTable.toString())
-    lines.push('')
   }
 
   return lines.join('\n')
@@ -232,14 +177,10 @@ export function renderPatchHeader(options: {
 export function renderContextList(entries: ContextIndex[]): string {
   if (entries.length === 0) {
     return [
-      header('📦', 'Context Cache'),
+      '📦 Context Cache',
       '',
       '  No snapshots found.',
-      '',
-      box('💡 Usage', [
-        'Snapshots are created automatically when tasks complete.',
-        'Run parallel_approve or parallel_patch to generate them.',
-      ]),
+      '  Snapshots are created automatically when tasks complete.',
     ].join('\n')
   }
 
@@ -247,64 +188,39 @@ export function renderContextList(entries: ContextIndex[]): string {
   const first = sorted[0].createdAt
   const last = sorted[sorted.length - 1].createdAt
 
-  const table = new Table({
-    chars: TABLE_CHARS,
-    head: ['Time', 'MCP', 'Task', 'Title', 'Status', 'Tokens'],
-    colWidths: [18, 10, 10, 28, 10, 10],
-    style: STYLE,
-  })
-
+  const lines = [
+    '📦 Context Cache Timeline',
+    '━'.repeat(52),
+    `snapshots: ${entries.length} | span: ${first} → ${last}`,
+    '',
+  ]
   for (const entry of sorted) {
-    table.push([
-      entry.createdAt,
-      entry.mcpId,
-      entry.taskId,
-      entry.title.slice(0, 26),
-      `${statusIcon(entry.status)} ${entry.status.slice(0, 4)}`,
-      formatTokens(entry.tokens),
-    ])
+    lines.push(`${statusIcon(entry.status)} ${entry.createdAt.slice(11, 19)} ${entry.mcpId} ${entry.taskId} ${entry.title.slice(0, 25)} ${formatTokens(entry.tokens)}t`)
   }
-
-  return [
-    header('📦', 'Context Cache Timeline'),
+  lines.push(
     '',
-    kvBlock([
-      ['project', process.cwd()],
-      ['snapshots', entries.length],
-      ['span', `${first} → ${last}`],
-    ]),
-    '',
-    table.toString(),
-    '',
-    box('💡 Usage', [
-      'parallel_context show <mcpId> <taskId>     查看快照详情',
-      'parallel_context restore <timestamp>        恢复到该时间点',
-    ]),
-  ].join('\n')
+    'Usage:',
+    '  parallel_context show <mcpId> <taskId>',
+    '  parallel_context restore <timestamp>',
+  )
+  return lines.join('\n')
 }
 
 export function renderContextDetail(snapshot: TaskContextSnapshot): string {
   return [
-    header('📋', `Context Detail: ${snapshot.mcpId}/${snapshot.taskId}`),
+    `📋 Context: ${snapshot.mcpId}/${snapshot.taskId}`,
+    '━'.repeat(52),
+    `role: ${snapshot.roleType} | status: ${statusIcon(snapshot.status)} ${snapshot.status}`,
+    `title: ${snapshot.title}`,
+    `time: ${snapshot.createdAt} | duration: ${formatDuration(snapshot.durationMs)} | tokens: ${formatTokens(snapshot.tokens)}`,
+    `session: ${snapshot.sessionId}`,
     '',
-    kvBlock([
-      ['mcp', snapshot.mcpId],
-      ['task', snapshot.taskId],
-      ['role', snapshot.roleType],
-      ['title', snapshot.title],
-      ['status', `${statusIcon(snapshot.status)} ${snapshot.status}`],
-      ['time', snapshot.createdAt],
-      ['duration', formatDuration(snapshot.durationMs)],
-      ['tokens', formatTokens(snapshot.tokens)],
-      ['session', snapshot.sessionId],
-    ]),
+    `› Files: ${snapshot.files.length > 0 ? snapshot.files.join(', ') : 'none'}`,
+    `› Requirement: ${snapshot.requirement.slice(0, 60)}`,
+    ...(snapshot.patchRequirement ? [`› Patch: ${snapshot.patchRequirement.slice(0, 60)}`] : []),
     '',
-    box('📁 Files', snapshot.files.length > 0 ? snapshot.files : ['none']),
-    '',
-    box('📝 Requirement', [snapshot.requirement.slice(0, 80)]),
-    ...(snapshot.patchRequirement ? ['', box('🔧 Patch Requirement', [snapshot.patchRequirement.slice(0, 80)])] : []),
-    '',
-    box('📄 Output Summary', snapshot.output.split('\n').slice(0, 12)),
+    '› Output:',
+    ...snapshot.output.split('\n').slice(0, 12).map(l => `  ${l}`),
   ].join('\n')
 }
 

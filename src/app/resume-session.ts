@@ -1,10 +1,8 @@
 import { SessionRuntime } from '../core/runtime/session-runtime.js'
 import { buildDashboardView } from '../core/report/dashboard-view.js'
 import { renderExecutionPlan, renderSessionOutcome } from '../core/terminal/renderers.js'
-import { parseWorkspaceMap, runForegroundExecution } from './foreground-execution.js'
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 
-export async function resumeSession(projectRoot: string, server?: Server): Promise<string> {
+export async function resumeSession(projectRoot: string): Promise<string> {
   const runtime = new SessionRuntime(projectRoot)
   const session = runtime.resume()
   if (!session) {
@@ -46,22 +44,30 @@ export async function resumeSession(projectRoot: string, server?: Server): Promi
     })
   }
 
-  const workspaceMap = parseWorkspaceMap(session.artifacts.workspaceMap)
-  const execution = await runForegroundExecution({
-    projectRoot,
-    session,
-    workspaces: workspaceMap,
-    title: '🔁 Parallel Session Resumed',
-    nextStep: finalSession => finalSession.phase === 'completed'
-      ? 'Use parallel_report to review the final execution summary.'
-      : 'Use parallel_dashboard to inspect blockers, workspace issues, and recovery suggestions.',
-    contextAnalysis: 'parallel resume execution in progress',
-    taskAction: 'resume-task-execution',
-    mergeAction: 'resume-merge-session',
-    mergeSuccessMessage: 'merge completed during resume',
-    mergeFailureFallback: 'merge failed during resume',
-    server,
-  })
+  // Reset stuck running tasks back to ready
+  const tasks = session.taskGraph.tasks
+  const stuckRunning = tasks.filter(t => t.status === 'running')
+  if (stuckRunning.length > 0) {
+    const updated = {
+      ...session,
+      taskGraph: {
+        ...session.taskGraph,
+        tasks: tasks.map(t => t.status === 'running' ? { ...t, status: 'ready' as const } : t),
+      },
+      mcps: session.mcps.map(m => m.status === 'running' ? { ...m, status: 'idle' as const } : m),
+    }
+    runtime.save(updated)
+  }
 
-  return execution.output
+  const completed = tasks.filter(t => t.status === 'completed').length
+  const total = tasks.length
+  return [
+    '🔁 Parallel Session Resumed',
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+    `Session: ${session.sessionId}`,
+    `进度: ${completed}/${total} 任务已完成`,
+    stuckRunning.length > 0 ? `已重置 ${stuckRunning.length} 个卡住的 running 任务为 ready` : '',
+    '',
+    '恢复完成。请立即调用 parallel_next_batch 获取可执行任务。',
+  ].filter(Boolean).join('\n')
 }

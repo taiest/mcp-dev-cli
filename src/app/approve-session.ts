@@ -2,10 +2,8 @@ import { SessionRuntime } from '../core/runtime/session-runtime.js'
 import { WorkspaceManager } from '../core/workspace/workspace-manager.js'
 import { createAuditRecord } from '../core/telemetry/audit-trail.js'
 import { createAgentFiles, summarizeAssignments } from './start-parallel-session.js'
-import { runForegroundExecution } from './foreground-execution.js'
 import { renderSessionOutcome } from '../core/terminal/renderers.js'
 import type { ExecutionSession } from '../types.js'
-import type { Server } from '@modelcontextprotocol/sdk/server/index.js'
 
 function withPreparedExecution(
   runtime: SessionRuntime,
@@ -35,7 +33,7 @@ function withPreparedExecution(
   ])
 }
 
-export async function approveSession(projectRoot: string, server?: Server): Promise<string> {
+export async function approveSession(projectRoot: string): Promise<string> {
   const runtime = new SessionRuntime(projectRoot)
   const session = runtime.load()
   if (!session) {
@@ -86,21 +84,16 @@ export async function approveSession(projectRoot: string, server?: Server): Prom
   }
   runtime.save(prepared)
 
-  const execution = await runForegroundExecution({
-    projectRoot,
-    session: prepared,
-    workspaces,
-    title: '✅ Parallel Execution Approved',
-    nextStep: finalSession => finalSession.phase === 'completed'
-      ? 'Use parallel_report to review the final execution summary.'
-      : 'Use parallel_dashboard to inspect blockers, recovery suggestions, and latest lane state.',
-    contextAnalysis: 'parallel approval execution in progress',
-    taskAction: 'approve-task-execution',
-    mergeAction: 'approve-merge-session',
-    mergeSuccessMessage: 'merge completed after approval',
-    mergeFailureFallback: 'merge failed after approval',
-    server,
-  })
-
-  return execution.output
+  const taskCount = prepared.taskGraph.tasks.length
+  const mcpCount = prepared.mcps.length
+  return [
+    '✅ Parallel Execution Approved',
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+    `Session: ${prepared.sessionId}`,
+    `MCP 角色: ${mcpCount} | 任务: ${taskCount}`,
+    `Workspaces: ${Object.keys(workspaces).length} 个 git worktree 已创建`,
+    '',
+    '准备完成。请立即调用 parallel_next_batch 获取第一批可执行任务。',
+    '然后用 Agent() 并行执行，每个设置 run_in_background: true。',
+  ].join('\n')
 }
