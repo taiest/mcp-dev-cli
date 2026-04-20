@@ -136,7 +136,7 @@ export interface Config {
 
 export const DEFAULT_CONFIG: Config = {
   model: 'sonnet',
-  maxConcurrency: 3,
+  maxConcurrency: 5,
   projectRoot: process.cwd(),
   autoConfirm: false,
   contextSummaryText: '',

@@ -7,7 +7,7 @@ import { buildDashboardView } from '../core/report/dashboard-view.js'
 import { SessionRuntime } from '../core/runtime/session-runtime.js'
 import { Scheduler } from '../core/scheduler/scheduler.js'
 import { createAuditRecord } from '../core/telemetry/audit-trail.js'
-import { renderExecutionSummaryTable, shouldBroadcast, formatTaskProgress, formatMergeProgress, formatBatchDispatch, renderLiveWorkerTable, renderLiveControllerConsole, formatControllerDecision, type WorkerLiveState } from '../core/terminal/ui.js'
+import { renderExecutionSummaryTable, shouldBroadcast, formatTaskProgress, formatMergeProgress, formatControllerDecision, type WorkerLiveState } from '../core/terminal/ui.js'
 import { WorkspaceManager } from '../core/workspace/workspace-manager.js'
 import { buildContextSummary } from '../core/context/context-summary.js'
 
@@ -41,6 +41,16 @@ export async function inspectWorkspaceStates(projectRoot: string, workspaces: Re
   return lines
 }
 
+import type { ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js'
+import type { RequestHandlerExtra } from '@modelcontextprotocol/sdk/shared/protocol.js'
+
+export type ToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>
+
+function formatDurationCompact(ms: number): string {
+  const s = Math.round(ms / 1000)
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`
+}
+
 export async function runForegroundExecution(options: {
   projectRoot: string
   session: ExecutionSession
@@ -53,6 +63,7 @@ export async function runForegroundExecution(options: {
   mergeSuccessMessage: string
   mergeFailureFallback: string
   server?: Server
+  extra?: ToolExtra
 }): Promise<{ session: ExecutionSession; report: ExecutionSummaryReport; progressEvents: ParallelProgressEvent[]; workspaceIssues: string[]; output: string }> {
   const runtime = new SessionRuntime(options.projectRoot)
   const scheduler = new Scheduler()
@@ -87,24 +98,67 @@ export async function runForegroundExecution(options: {
   const workerStates = new Map<string, WorkerLiveState>()
   let lastWorkerBroadcast = 0
   let lastControllerBroadcast = 0
-  const WORKER_THROTTLE_MS = 8_000
+  const WORKER_THROTTLE_MS = 4_000
   const CONTROLLER_THROTTLE_MS = 2_500
+
+  let progressCount = 0
+  const pendingTasks = options.session.taskGraph.tasks.filter(t => t.status !== 'completed' && t.status !== 'failed').length
+  const totalEstimate = Math.max(pendingTasks, 1) * 10
+
+  const sendProgress = (message: string) => {
+    if (!options.extra?._meta?.progressToken) return
+    progressCount++
+    options.extra.sendNotification({
+      method: 'notifications/progress',
+      params: {
+        progressToken: options.extra._meta.progressToken,
+        progress: Math.min(progressCount, totalEstimate - 1),
+        total: totalEstimate,
+        message: message.slice(0, 200),
+      },
+    }).catch(() => {})
+  }
+
+  // Heartbeat: send progress every 15s even if no broadcast fires, to prevent MCP timeout
+  const heartbeat = setInterval(() => {
+    const summary = Array.from(workerStates.values())
+      .map(w => `${w.mcpId}:${w.status}`)
+      .join(' | ') || 'waiting'
+    broadcast(`heartbeat: ${summary}`)
+  }, 15_000)
 
   const broadcast = (msg: string) => {
     if (!options.server) return
     options.server.sendLoggingMessage({ level: 'info', logger: 'mcp-dev-cli', data: msg }).catch(() => {})
+    sendProgress(msg)
   }
 
   const broadcastWorkerTable = () => {
     if (workerStates.size === 0) return
-    broadcast(renderLiveWorkerTable(workerStates))
+    const now = Date.now()
+    const lines = Array.from(workerStates.values()).map(w => {
+      const elapsed = formatDurationCompact(w.durationMs ?? (now - w.startedAt))
+      const icon = w.status === 'completed' ? '✅' : w.status === 'failed' ? '❌' : '🔄'
+      const tokens = w.totalTokens ? `${Math.round(w.totalTokens / 1000)}k` : '-'
+      const snippet = (w.snippet || '').slice(0, 30)
+      return `${icon} ${w.mcpId} ${w.taskId} ${elapsed} ${tokens}t ${snippet}`
+    })
+    broadcast(lines.join('\n'))
   }
 
   const broadcastControllerConsole = (session: ExecutionSession, force = false) => {
     const now = Date.now()
     if (!force && now - lastControllerBroadcast < CONTROLLER_THROTTLE_MS) return
     lastControllerBroadcast = now
-    broadcast(renderLiveControllerConsole(session))
+    const lanes = session.laneStates || []
+    const running = lanes.filter(l => l.status === 'running').length
+    const done = lanes.reduce((s, l) => s + l.completedTaskCount, 0)
+    const decisions = (session.controllerDecisions || []).slice(-2)
+    const lines = [
+      `🧠 ${running} running | ${done} done`,
+      ...decisions.map(d => `  ${d.timestamp.slice(11, 19)} ${d.summary.slice(0, 50)}`),
+    ]
+    broadcast(lines.join('\n'))
   }
 
   const finalSession = await executeSessionPipeline({
@@ -128,6 +182,7 @@ export async function runForegroundExecution(options: {
 
       // Track worker states
       if (event.kind === 'worker' && event.mcpId) {
+        sendProgress(`${event.mcpId}: ${event.snippet || event.status || 'running'}`)
         const key = event.mcpId
         const existing = workerStates.get(key)
         const status = (event.status || 'running') as WorkerLiveState['status']
@@ -170,7 +225,9 @@ export async function runForegroundExecution(options: {
       if (!shouldBroadcast(event)) return
 
       if (event.kind === 'batch' && event.message.includes('dispatching') && session) {
-        broadcast(formatBatchDispatch([event], session.taskGraph.tasks))
+        const dispatched = session.taskGraph.tasks.filter(t => t.assignedMcpId)
+        const lines = dispatched.map(t => `  ${t.assignedMcpId} ${t.roleType} → ${t.id}: ${t.title.slice(0, 30)}`)
+        broadcast(`🚀 dispatching ${dispatched.length} tasks\n${lines.join('\n')}`)
       } else if (event.kind === 'task') {
         broadcast(formatTaskProgress(event))
         if (session) broadcastControllerConsole(session)
@@ -181,6 +238,21 @@ export async function runForegroundExecution(options: {
       }
     },
   })
+
+  clearInterval(heartbeat)
+
+  // Send final progress = total to signal completion
+  if (options.extra?._meta?.progressToken) {
+    options.extra.sendNotification({
+      method: 'notifications/progress',
+      params: {
+        progressToken: options.extra._meta.progressToken,
+        progress: totalEstimate,
+        total: totalEstimate,
+        message: 'execution complete',
+      },
+    }).catch(() => {})
+  }
 
   const report = new ReportBuilder().build(finalSession)
   runtime.saveReport(report)

@@ -27,7 +27,10 @@ export class ResumeRebuilder {
       })),
       taskGraph: {
         ...session.taskGraph,
-        tasks: session.taskGraph.tasks.map(task => ({ ...task })),
+        tasks: session.taskGraph.tasks.map(task => ({
+          ...task,
+          status: task.status === 'running' ? 'ready' : task.status,
+        })),
       },
       controllerPlan: session.controllerPlan ? { ...session.controllerPlan, laneRoleRecommendations: [...session.controllerPlan.laneRoleRecommendations], reasoning: [...session.controllerPlan.reasoning] } : session.controllerPlan,
       laneStates: session.laneStates?.map(lane => ({ ...lane })),

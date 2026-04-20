@@ -7,6 +7,9 @@ import { initProjectApp } from './app/init-project.js'
 import { startParallelSession } from './app/start-parallel-session.js'
 import { approveSession } from './app/approve-session.js'
 import { resumeSession } from './app/resume-session.js'
+import { getNextBatch, renderNextBatch } from './app/next-batch.js'
+import { reportTaskDone } from './app/task-done.js'
+import { finalizeSession } from './app/finalize-session.js'
 import { getDashboard } from './app/get-dashboard.js'
 import { exportParallelReport } from './app/export-report.js'
 import { switchModel } from './app/switch-model.js'
@@ -31,7 +34,7 @@ async function runInstallCommand() {
 async function startMcpServer() {
   const server = new McpServer({
     name: 'mcp-dev-cli',
-    version: '0.7.0',
+    version: '1.0.1',
   })
 
   server.tool(
@@ -126,26 +129,71 @@ async function startMcpServer() {
 
   server.tool(
     'parallel_approve',
-    '【确认执行】确认执行计划后启动：创建各角色工作区，开始多角色并行开发，实时输出进度。',
+    '【确认执行】确认执行计划后启动：创建各角色工作区，准备并行开发环境。完成后请调用 parallel_next_batch 获取可执行任务。',
     {
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
     },
     async ({ projectRoot }) => {
       const root = projectRoot || findProjectRoot()
-      const result = await approveSession(root, server.server)
+      const result = await approveSession(root)
       return { content: [{ type: 'text' as const, text: result }] }
     }
   )
 
   server.tool(
     'parallel_resume',
-    '【恢复任务】恢复中断的开发任务，从上次进度继续执行。',
+    '【恢复任务】恢复中断的开发任务。完成后请调用 parallel_next_batch 获取可执行任务。',
     {
       projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
     },
     async ({ projectRoot }) => {
       const root = projectRoot || findProjectRoot()
-      const result = await resumeSession(root, server.server)
+      const result = await resumeSession(root)
+      return { content: [{ type: 'text' as const, text: result }] }
+    }
+  )
+
+  server.tool(
+    'parallel_next_batch',
+    '【获取任务批次】获取下一批可并行执行的任务。返回适合 Claude Code 前端直接启动 Agent() 的任务元信息、展示文本和原始 JSON。',
+    {
+      projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+    },
+    async ({ projectRoot }) => {
+      const root = projectRoot || findProjectRoot()
+      const result = await getNextBatch(root)
+      return { content: [{ type: 'text' as const, text: renderNextBatch(result) }] }
+    }
+  )
+
+  server.tool(
+    'parallel_task_done',
+    '【回报任务完成】Agent 执行完成后调用此工具回报结果。系统会自动解锁依赖任务。',
+    {
+      taskId: z.string().min(1).describe('任务 ID，如 task-1'),
+      mcpId: z.string().min(1).describe('执行该任务的 MCP 角色 ID，如 MCP-02'),
+      success: z.boolean().describe('任务是否成功完成'),
+      output: z.string().describe('Agent 的执行输出摘要'),
+      durationMs: z.number().optional().describe('执行耗时（毫秒）'),
+      totalTokens: z.number().optional().describe('消耗的 token 数'),
+      projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+    },
+    async ({ taskId, mcpId, success, output, durationMs, totalTokens, projectRoot }) => {
+      const root = projectRoot || findProjectRoot()
+      const result = await reportTaskDone(root, { taskId, mcpId, success, output, durationMs, totalTokens })
+      return { content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }] }
+    }
+  )
+
+  server.tool(
+    'parallel_finalize',
+    '【完成合并】所有任务完成后调用。执行代码合并、质量门检查、生成最终报告。',
+    {
+      projectRoot: z.string().optional().describe('项目根目录路径，留空则自动检测'),
+    },
+    async ({ projectRoot }) => {
+      const root = projectRoot || findProjectRoot()
+      const result = await finalizeSession(root)
       return { content: [{ type: 'text' as const, text: result }] }
     }
   )
@@ -219,7 +267,7 @@ async function startMcpServer() {
     },
     async ({ requirement, targetMcpId, projectRoot }) => {
       const root = projectRoot || findProjectRoot()
-      const result = await patchSession(root, requirement, targetMcpId, server.server)
+      const result = await patchSession(root, requirement, targetMcpId)
       return { content: [{ type: 'text' as const, text: result }] }
     }
   )
@@ -275,7 +323,10 @@ async function startMcpServer() {
         '│ 录入需求 │ parallel_requirement │ 录入本轮开发需求      │',
         '│ 环境检查 │ parallel_preflight   │ 检查 Git/Node 等环境  │',
         '│ 生成计划 │ parallel_start       │ 拆任务、分角色、出计划│',
-        '│ 确认执行 │ parallel_approve     │ 审批计划并启动开发    │',
+        '│ 确认执行 │ parallel_approve     │ 审批计划并准备环境    │',
+        '│ 获取任务 │ parallel_next_batch  │ 获取前端 Agent 批次   │',
+        '│ 回报完成 │ parallel_task_done   │ Agent 完成后回报结果  │',
+        '│ 完成合并 │ parallel_finalize    │ 合并代码并生成报告    │',
         '│ 恢复任务 │ parallel_resume      │ 恢复中断的开发任务    │',
         '│ 查看进度 │ parallel_dashboard   │ 查看各角色和任务状态  │',
         '│ 查看报告 │ parallel_report      │ 查看本轮开发总结      │',
@@ -287,7 +338,7 @@ async function startMcpServer() {
         '└──────────┴──────────────────────┴───────────────────────┘',
         '',
         '标准流程：',
-        '  初始化 → 状态总览 → 录入需求 → 生成计划 → 确认执行 → 查看报告',
+        '  初始化 → 状态总览 → 录入需求 → 生成计划 → 确认执行 → 获取任务 → Agent前端并行 → 回报完成 → 完成合并 → 查看报告',
         '',
         '你可以直接用中文名称描述你想做的事，系统会自动匹配对应工具。',
         '例如："帮我初始化"、"录入需求：添加用户登录功能"、"查看进度"',
@@ -312,7 +363,13 @@ async function runUninstallCommand() {
 
 const command = process.argv[2]
 
-if (command === 'install') {
+if (command === '--version' || command === '-v') {
+  const { readFileSync } = await import('fs')
+  const { fileURLToPath } = await import('url')
+  const { dirname, join } = await import('path')
+  const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf-8'))
+  process.stdout.write(`${pkg.version}\n`)
+} else if (command === 'install') {
   await runInstallCommand()
 } else if (command === 'uninstall') {
   await runUninstallCommand()
